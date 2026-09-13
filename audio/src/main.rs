@@ -23,6 +23,7 @@ extern crate libc;
 extern crate librs;
 extern crate rsrt;
 
+mod example_pcm;
 mod mood_pcm;
 
 use librs::syscall::Syscall;
@@ -135,9 +136,9 @@ fn play_audio() -> std::io::Result<()> {
     println!("=== Audio Playback ===");
     let pcm = &mood_pcm::MOOD_PCM;
     println!(
-        "Playing mood_pcm ({} bytes, 16-bit mono @ 16 kHz, ~{} s)",
+        "Playing mood_pcm ({} bytes, 16-bit stereo @ 16 kHz → mono downmix, ~{} s)",
         pcm.len(),
-        pcm.len() / 2 / 16_000
+        pcm.len() / 4 / 16_000
     );
 
     let mut file = std::fs::OpenOptions::new()
@@ -145,39 +146,40 @@ fn play_audio() -> std::io::Result<()> {
         .open("/dev/i2s0")?;
 
     // MOOD_PCM 位于 flash (.rodata)，SRAM 只有 512 KB。
-    // 数据是 16-bit 单声道 PCM (2 字节/样本)，I2S 要求 32-bit slot /
-    // 16-bit LJ 立体声 (8 字节/帧)。每个单声道样本复制为 L=R，各自
-    // 左对齐到 32-bit slot。分段从 flash 读取转换到 DRAM 缓冲区。
+    // 数据是 16-bit 立体声 PCM (4 字节/帧)。ES8311 是单声道 codec，
+    // 只播放 slot0。下混为单声道: mono = (L+R)/2，再左对齐填入
+    // 32-bit slot0。I2S TDM 配置为 4 slot × 32-bit = 16 字节/帧。
+    // 每帧转换: [L_lo,L_hi,R_lo,R_hi] → 4 个 32-bit LJ slot
+    // (mono, 0, 0, 0)。
     //
-    // DMA 描述符 size 字段为 12 位，单次传输上限 4095 字节。
-    // 取 4088 字节 (511 帧 × 8 字节，8 字节对齐) 最大化每次传输，
-    // 减少 DMA 间隙，降低 FIFO 下溢导致的杂音。
-    const LJ_CHUNK: usize = 4088; // 511 frames × 8 bytes
-    const RAW_CHUNK: usize = LJ_CHUNK / 4; // 511 samples × 2 bytes = 1022
-    let mut buf: Vec<u8> = vec![0u8; LJ_CHUNK];
+    // 策略: 先将一批 raw PCM 从 flash 预转换到 DRAM 缓冲区，再一次性
+    // write_all 整批到 I2S。驱动内部自动分块为 4080 字节单描述符，
+    // 块间间隙仅 ~0.3 µs（寄存器写入），远小于 FIFO 排空时间 ~16 µs，
+    // 不会产生下溢，音频连续。
+    const BATCH_FRAMES: usize = 2048; // 128 ms @ 16 kHz
+    const BATCH_RAW: usize = BATCH_FRAMES * 4; // 8192 bytes
+    const BATCH_LJ: usize = BATCH_FRAMES * 16; // 32768 bytes
+    let mut buf: Vec<u8> = vec![0u8; BATCH_LJ];
     let mut offset = 0usize;
 
     while offset < pcm.len() {
-        let raw_len = RAW_CHUNK.min(pcm.len() - offset);
-        // 确保按完整样本对齐 (2 字节)
-        let raw_len = raw_len & !1;
-        if raw_len == 0 {
-            break;
-        }
-        let samples = raw_len / 2;
-        let lj_len = samples * 8;
+        let raw_len = BATCH_RAW.min(pcm.len() - offset);
+        let frames = raw_len / 4;
+        let lj_len = frames * 16;
 
-        for s in 0..samples {
-            let src = offset + s * 2;
-            let dst = s * 8;
+        for f in 0..frames {
+            let src = offset + f * 4;
+            let dst = f * 16;
+            let l = i16::from_le_bytes([pcm[src], pcm[src + 1]]);
+            let r = i16::from_le_bytes([pcm[src + 2], pcm[src + 3]]);
+            let mono = ((l as i32 + r as i32) >> 1) as i16;
+            let m = mono.to_le_bytes();
+            // slot 0: mono (left-justified 16-bit into 32-bit slot)
             buf[dst] = 0x00;
             buf[dst + 1] = 0x00;
-            buf[dst + 2] = pcm[src];
-            buf[dst + 3] = pcm[src + 1];
-            buf[dst + 4] = 0x00;
-            buf[dst + 5] = 0x00;
-            buf[dst + 6] = pcm[src];
-            buf[dst + 7] = pcm[src + 1];
+            buf[dst + 2] = m[0];
+            buf[dst + 3] = m[1];
+            // slot 1-3: 0 (buf already zero-initialized)
         }
 
         file.write_all(&buf[..lj_len])?;
@@ -188,6 +190,63 @@ fn play_audio() -> std::io::Result<()> {
         "Playback complete ({} raw bytes, {} LJ bytes written)",
         offset,
         offset * 4
+    );
+    Ok(())
+}
+
+/// Play TTS audio from `example_pcm.rs`.
+///
+/// `EXAMPLE_PCM` is 16-bit **mono** @ 16 kHz (2 bytes per frame).
+/// The I2S TDM hardware expects 4 slots × 32-bit = 16 bytes per frame.
+/// Each 16-bit mono sample is left-justified into slot0's high 16 bits;
+/// slots 1–3 are zero.
+fn play_tts() -> std::io::Result<()> {
+    println!("=== TTS Playback ===");
+    let pcm = &example_pcm::EXAMPLE_PCM;
+    println!(
+        "Playing example_pcm ({} bytes, 16-bit mono @ 16 kHz, ~{:.1} s)",
+        pcm.len(),
+        pcm.len() as f32 / 2.0 / 16_000.0
+    );
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/i2s0")?;
+
+    // Each raw frame = 2 bytes (16-bit mono).
+    // Each TDM frame = 16 bytes (4 slots × 32-bit).
+    const BATCH_FRAMES: usize = 2048; // 128 ms @ 16 kHz
+    const BATCH_RAW: usize = BATCH_FRAMES * 2; // 4096 bytes
+    const BATCH_LJ: usize = BATCH_FRAMES * 16; // 32768 bytes
+    let mut buf: Vec<u8> = vec![0u8; BATCH_LJ];
+    let mut offset = 0usize;
+
+    while offset < pcm.len() {
+        let raw_len = BATCH_RAW.min(pcm.len() - offset);
+        let frames = raw_len / 2;
+        let lj_len = frames * 16;
+
+        for f in 0..frames {
+            let src = offset + f * 2;
+            let dst = f * 16;
+            let mono = i16::from_le_bytes([pcm[src], pcm[src + 1]]);
+            let m = mono.to_le_bytes();
+            // slot 0: mono left-justified into 32-bit slot (high 16 bits)
+            buf[dst] = 0x00;
+            buf[dst + 1] = 0x00;
+            buf[dst + 2] = m[0];
+            buf[dst + 3] = m[1];
+            // slot 1-3: 0 (buf already zero-initialized)
+        }
+
+        file.write_all(&buf[..lj_len])?;
+        offset += raw_len;
+    }
+
+    println!(
+        "Playback complete ({} raw bytes, {} LJ bytes written)",
+        offset,
+        offset * 8
     );
     Ok(())
 }
@@ -296,5 +355,5 @@ fn main() -> std::io::Result<()> {
     */
 
     // Step 4: Play audio via I2S (depends on GDMA being functional).
-    play_audio()
+    play_tts()
 }

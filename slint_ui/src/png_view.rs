@@ -5,7 +5,7 @@
 // while a PNG is displayed, the Slint software renderer's draw_if_needed is
 // suspended so the direct pixels are not overwritten.
 //
-// Ported from shihange's slint_sdcard (commit 66e8973), adapted to the
+// Ported from shihange's SD-card example (commit 66e8973), adapted to the
 // slint_ui FbFile API and the existing SD card page layout.
 
 use crate::FbFile;
@@ -453,9 +453,6 @@ struct PngFramebufferWriter<'a> {
     image_x: usize,
     image_y: usize,
     overlay_line: [u8; 960], // 480px * 2 bytes
-    rgb565_batch: Vec<u8>,
-    batch_first_line: usize,
-    batch_line_count: usize,
 }
 
 impl<'a> PngFramebufferWriter<'a> {
@@ -475,7 +472,6 @@ impl<'a> PngFramebufferWriter<'a> {
         overlay_line[panel_end - 2..panel_end]
             .copy_from_slice(&Rgb565Pixel(PNG_PANEL_BORDER).0.to_be_bytes());
 
-        // Pre-compute image X position and panel background batch
         Self {
             fb,
             image_x: PNG_DISPLAY_X
@@ -483,82 +479,38 @@ impl<'a> PngFramebufferWriter<'a> {
             image_y: PNG_DISPLAY_Y
                 + (PNG_DISPLAY_MAX_HEIGHT as usize - request.display_height as usize) / 2,
             overlay_line,
-            rgb565_batch: Vec::new(),
-            batch_first_line: 0,
-            batch_line_count: 0,
         }
     }
 
-    fn flush(&mut self) -> IoResult<()> {
-        if self.batch_line_count == 0 {
+    /// Write one composed scanline to the framebuffer. A 960-byte scratch row
+    /// is filled from the overlay background, blended with the decoded image
+    /// pixels, then sent as a single-row draw_area. This replaces a 15 KiB
+    /// batch buffer that OOM'd on the heap (Vec) or overflowed the UI-thread
+    /// stack (inline array) — PNG rendering now costs ~1 KiB stack only.
+    fn append_full_row(&mut self, line: usize, pixels: Option<&[Rgb565Pixel]>) -> IoResult<()> {
+        if line >= 480 {
             return Ok(());
         }
-        let byte_count = self.batch_line_count * 960;
-        let offset = self.batch_first_line as u64 * 960u64;
-        if offset > libc::off_t::MAX as u64 {
-            return Err(Error::from_raw_os_error(libc::EINVAL));
-        }
-        let lseek_offset = librs::syscall::sys::Sys::lseek(
-            self.fb.fd,
-            offset as libc::off_t,
-            libc::SEEK_SET,
-        );
-        if lseek_offset < 0 {
-            return Err(Error::from_raw_os_error(-lseek_offset as i32));
-        }
-        let mut buf = &self.rgb565_batch[..byte_count];
-        while !buf.is_empty() {
-            match librs::syscall::sys::Sys::write(self.fb.fd, buf) {
-                Ok(0) => return Err(Error::new(ErrorKind::WriteZero, "failed to write framebuffer")),
-                Ok(n) => buf = &buf[n..],
-                Err(librs::errno::Errno(errno)) => return Err(Error::from_raw_os_error(errno)),
-            }
-        }
-        self.batch_line_count = 0;
-        Ok(())
-    }
-
-    fn append_full_row(&mut self, line: usize, pixels: Option<&[Rgb565Pixel]>) -> IoResult<()> {
-        if self.batch_line_count > 0 && line != self.batch_first_line + self.batch_line_count {
-            self.flush()?;
-        }
-        if self.batch_line_count == 0 {
-            self.batch_first_line = line;
-        }
-
-        let start = self.batch_line_count * 960;
-        if start + 960 > self.rgb565_batch.len() {
-            self.rgb565_batch.resize(start + 960, 0);
-        }
-        let output = &mut self.rgb565_batch[start..start + 960];
-        output.copy_from_slice(&self.overlay_line);
+        let mut row = [0u8; 960];
+        row.copy_from_slice(&self.overlay_line);
         if let Some(pixels) = pixels {
             let image_start = self.image_x * 2;
-            for (dst, pixel) in output[image_start..].chunks_exact_mut(2).zip(pixels.iter()) {
+            for (dst, pixel) in row[image_start..].chunks_exact_mut(2).zip(pixels.iter()) {
                 dst.copy_from_slice(&pixel.0.to_be_bytes());
             }
         }
-
-        self.batch_line_count += 1;
-        if self.batch_line_count == PNG_FRAMEBUFFER_BATCH_LINES {
-            self.flush()?;
-        }
-        Ok(())
+        // Single-row draw_area: width covers the full 480px panel line so the
+        // overlay background and border are written together with the image.
+        self.fb.draw_area(&row, 0, line, 480, 1, 960).map(|_| ())
     }
 
     fn draw_row(&mut self, display_y: usize, pixels: &[Rgb565Pixel]) -> IoResult<()> {
         self.append_full_row(self.image_y + display_y, Some(pixels))
     }
 
-    fn finish(mut self) -> IoResult<()> {
-        // Keep the final CO5300 rectangle even-height. Extra row = overlay bg only.
-        if self.batch_line_count > 0 && self.batch_line_count & 1 != 0 {
-            let line = self.batch_first_line + self.batch_line_count;
-            if line < 480 {
-                self.append_full_row(line, None)?;
-            }
-        }
-        self.flush()
+    fn finish(self) -> IoResult<()> {
+        // Nothing to flush: every row is written immediately.
+        Ok(())
     }
 }
 
@@ -684,20 +636,8 @@ pub(crate) fn render_png_to_framebuffer(
     let mut current_row: &mut [u8] = &mut [];
     let mut source_x_map: &[u16] = &[];
     let mut output: &mut [Rgb565Pixel] = &mut [];
-    let mut decoder_update_count = 0usize;
 
     let mut writer = PngFramebufferWriter::new(fb, request);
-    println!(
-        "[PNG] placement panel=({},{} {}x{}) image=({},{} {}x{})",
-        PNG_PANEL_X,
-        PNG_PANEL_Y,
-        PNG_PANEL_W,
-        PNG_PANEL_H,
-        writer.image_x,
-        writer.image_y,
-        request.display_width,
-        request.display_height
-    );
 
     loop {
         if input_offset == input_length {
@@ -710,10 +650,6 @@ pub(crate) fn render_png_to_framebuffer(
 
         let previous_filled = region.filled;
         let previous_source_y = source_y;
-        decoder_update_count += 1;
-        if stream_info.is_none() {
-            let _ = decoder_update_count; // suppress unused warning
-        }
         let (consumed, decoded) = decoder
             .update(
                 &input[input_offset..input_length],
@@ -733,13 +669,6 @@ pub(crate) fn render_png_to_framebuffer(
                         "PNG changed after it was selected",
                     ));
                 }
-                println!(
-                    "[PNG] stream color={:?} depth={:?} row_bytes={} filter_bpp={}",
-                    parsed.color_type,
-                    parsed.bit_depth,
-                    parsed.row_length - 1,
-                    parsed.filter_bytes_per_pixel
-                );
                 let row_bytes = parsed.row_length - 1;
                 if row_bytes > MAX_ROW_BYTES {
                     return Err(Error::new(

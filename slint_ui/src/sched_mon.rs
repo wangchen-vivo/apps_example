@@ -328,7 +328,6 @@ struct TaskEntry {
     tid_disp: String,
     type_abbr: String,
     state_abbr: String,
-    state: String, // full State string for sorting
     prio_str: String,
     typed_name: String,
 }
@@ -379,12 +378,13 @@ impl SchedMonitor {
             }
         };
 
-        // Collect status for all threads
-        let mut entries: Vec<TaskEntry> = Vec::with_capacity(tids.len());
-        let mut kind_counts: std::collections::BTreeMap<String, usize> =
-            std::collections::BTreeMap::new();
+        // Collect status for all threads. Start with zero capacity so the Vec
+        // grows incrementally; pre-allocating capacity = tids.len() (≈120
+        // threads) reserved ~14 KiB in one shot and tipped the 272 KiB system
+        // heap into OOM on this page.
+        let mut entries: Vec<TaskEntry> = Vec::new();
 
-        for &tid in &tids {
+        for &tid in tids.iter() {
             let path = path_for_task_status(tid);
             let (tid_str, type_abbr, state_abbr, prio_str, typed_name) =
                 if let Ok(content) = read_proc_file(&path) {
@@ -398,35 +398,20 @@ impl SchedMonitor {
                         "?".into(),
                     )
                 };
-            // Read raw state for sort key
-            let state_raw = if let Ok(content) = read_proc_file(&path) {
-                let text = core::str::from_utf8(&content).unwrap_or("");
-                text.lines()
-                    .find_map(|l| l.trim().strip_prefix("State:"))
-                    .map(|s| s.trim().to_string())
-                    .unwrap_or_default()
-            } else {
-                String::new()
-            };
-
-            let name_for_count = typed_name.clone();
-
-            *kind_counts.entry(name_for_count).or_insert(0) += 1;
 
             entries.push(TaskEntry {
                 tid_disp: tid_str,
                 type_abbr,
                 state_abbr,
-                state: state_raw,
                 prio_str,
                 typed_name,
             });
         }
 
         // Sort: running first, then ready, then others; stable to preserve TID order for ties.
-        entries.sort_by_key(|e| match e.state.as_str() {
-            "running" => 0,
-            "ready" => 1,
+        entries.sort_by_key(|e| match e.state_abbr.as_str() {
+            "RUNNING" => 0,
+            "READY" => 1,
             _ => 2,
         });
 
@@ -458,17 +443,19 @@ impl SchedMonitor {
         // Update rows in-place via existing VecModels. Only changed rows
         // dirty the scene; replacing the whole model every tick forced all
         // 4×5 Text cells to recompute (248 dirty lines, 330ms per frame).
-        update_task_model(&ui.get_task_tids(), &tid_col);
-        update_task_model(&ui.get_task_types(), &type_col);
-        update_task_model(&ui.get_task_states(), &state_col);
-        update_task_model(&ui.get_task_prios(), &prio_col);
-        update_task_model(&ui.get_task_names(), &name_col);
-        ui.set_task_hidden(
-            tids.len()
-                .saturating_sub(self.scroll_offset + MAX_TASK_LINES) as i32,
-        );
-        ui.set_task_total(tids.len() as i32);
-        self.total_tasks = tids.len();
+        {
+            update_task_model(&ui.get_task_tids(), &tid_col);
+            update_task_model(&ui.get_task_types(), &type_col);
+            update_task_model(&ui.get_task_states(), &state_col);
+            update_task_model(&ui.get_task_prios(), &prio_col);
+            update_task_model(&ui.get_task_names(), &name_col);
+            ui.set_task_hidden(
+                tids.len()
+                    .saturating_sub(self.scroll_offset + MAX_TASK_LINES) as i32,
+            );
+            ui.set_task_total(tids.len() as i32);
+            self.total_tasks = tids.len();
+        }
     }
 
     fn tick(&mut self, ui: &MainWindow) {

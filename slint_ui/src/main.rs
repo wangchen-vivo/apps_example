@@ -837,14 +837,6 @@ impl slint::platform::Platform for BluekernelBackend {
                     let mut s = state.borrow_mut();
                     if let Some(request) = s.pending.take() {
                         drop(s);
-                        println!(
-                            "[PNG] rendering {}x{} -> {}x{}: {}",
-                            request.source_width,
-                            request.source_height,
-                            request.display_width,
-                            request.display_height,
-                            request.path
-                        );
                         if let Err(error) = png_view::render_png_to_framebuffer(&mut fb, &request) {
                             println!("[PNG] render error: {error}");
                             state.borrow_mut().active = false;

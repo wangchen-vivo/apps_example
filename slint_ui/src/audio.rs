@@ -104,13 +104,12 @@ fn playback_tick(ui: &MainWindow) {
 
         let raw_len = RAW_CHUNK.min(pcm.len() - player.offset) & !1;
         if raw_len == 0 {
-            // Playback complete
+            // Playback complete — close /dev/i2s0 so the kernel drains the
+            // TX ring and stops the DMA engine (File drop → close → drain_and_stop).
             println!("[AUDIO] Playback complete ({} bytes)", player.offset);
             ui.set_audio_status("播放完成".into());
             ui.set_audio_playing(false);
-            if let Some(ref mut f) = player.file {
-                let _ = f.flush();
-            }
+            drop(player.file.take());
             return;
         }
 
@@ -195,7 +194,16 @@ impl AudioVolumeFd {
 
     fn write_volume(&self, value: u8) -> IoResult<()> {
         let text = format!("{}\n", value);
-        let mut bytes = text.as_bytes();
+        self.write_bytes(text.as_bytes())
+    }
+
+    /// Write a textual command (e.g. "mute\n", "unmute\n") to the
+    /// audio_volume device. The kernel parses these case-insensitively.
+    fn write_command(&self, cmd: &[u8]) -> IoResult<()> {
+        self.write_bytes(cmd)
+    }
+
+    fn write_bytes(&self, mut bytes: &[u8]) -> IoResult<()> {
         while !bytes.is_empty() {
             match librs::syscall::sys::Sys::write(self.0, bytes) {
                 Ok(0) => {
@@ -268,6 +276,20 @@ impl AudioVolumeController {
         }
     }
 
+    /// Soft-mute/unmute the DAC. Used to suppress the I2S startup/stop pop:
+    /// mute before DMA starts/stops, unmute after the DMA ring has filled.
+    fn set_mute(&self, mute: bool) {
+        let Some(fd) = self.fd.as_ref() else {
+            return;
+        };
+        let cmd: &[u8] = if mute { b"mute\n" } else { b"unmute\n" };
+        if let Err(error) = fd.write_command(cmd) {
+            println!("[AUDIO_VOL] mute={} failed: {error}", mute);
+        } else {
+            println!("[AUDIO_VOL] mute={}", mute);
+        }
+    }
+
     /// Read the current volume, returned as a 0-100 percentage.
     fn get(&self) -> u8 {
         let Some(fd) = self.fd.as_ref() else {
@@ -322,6 +344,13 @@ pub(crate) fn install(ui: &MainWindow) -> slint::Timer {
         }
     });
 
+    let play_controller = volume_controller.clone();
+    let unmute_controller = volume_controller.clone();
+    // One-shot timer reused across playbacks to unmute the DAC after the
+    // DMA ring has filled. Owned here and moved into the play callback.
+    let unmute_timer = slint::Timer::default();
+    let unmute_timer = Rc::new(unmute_timer);
+    let unmute_timer_play = unmute_timer.clone();
     ui.on_audio_play(move || {
         let ui = match ui_weak.upgrade() {
             Some(ui) => ui,
@@ -340,14 +369,29 @@ pub(crate) fn install(ui: &MainWindow) -> slint::Timer {
             player.file = None;
         });
 
+        // Mute the DAC before starting DMA so the I2S startup pop is
+        // suppressed. The one-shot timer unmutes after the DMA ring has
+        // had time to fill and the DAC output has settled.
+        play_controller.borrow().set_mute(true);
+
         ui.set_audio_playing(true);
         if DIAGNOSTIC_TONE {
             println!("[AUDIO] Play started: 1 kHz diagnostic square wave");
         } else {
             println!("[AUDIO] Play started: PCM music");
         }
+
+        let unmute_ctrl = unmute_controller.clone();
+        unmute_timer_play.start(
+            slint::TimerMode::SingleShot,
+            std::time::Duration::from_millis(30),
+            move || {
+                unmute_ctrl.borrow().set_mute(false);
+            },
+        );
     });
 
+    let stop_controller = volume_controller.clone();
     ui.on_audio_stop(move || {
         let ui = match ui_weak2.upgrade() {
             Some(ui) => ui,
@@ -356,6 +400,11 @@ pub(crate) fn install(ui: &MainWindow) -> slint::Timer {
 
         ui.set_audio_playing(false);
         ui.set_audio_status("已停止".into());
+        // Mute before draining so the stop transition is silent.
+        stop_controller.borrow().set_mute(true);
+        // Drop the I2S file handle so the kernel drains the TX ring and
+        // stops the DMA engine (File drop → close → drain_and_stop).
+        PLAYER.with(|p| drop(p.borrow_mut().file.take()));
         println!("[AUDIO] Stopped");
     });
 
