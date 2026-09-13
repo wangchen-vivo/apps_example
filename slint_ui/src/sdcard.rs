@@ -16,9 +16,8 @@ use crate::app_window::{MainWindow, SdFileEntry};
 use crate::png_view::{self, SharedPngRenderState};
 use slint::{ComponentHandle, Model};
 use std::cell::RefCell;
-use std::fs::{self, File};
-use std::io::{Error, ErrorKind, Read, Result as IoResult, Write};
-use std::path::{Path, PathBuf};
+use std::io::{Read, Result as IoResult};
+use std::path::Path;
 use std::rc::Rc;
 
 #[path = "text_pages.rs"]
@@ -27,13 +26,6 @@ mod text_pages;
 const SD_ROOT: &str = "/data";
 const MAX_VISIBLE_ENTRIES: usize = 5;
 const TEXT_FILE_LIMIT: usize = 8 * 1024;
-const DOCUMENTS_DIR: &str = "/data/Documents";
-const PICTURES_DIR: &str = "/data/Pictures";
-const SOUNDS_DIR: &str = "/data/Sounds";
-const BACKUP_DIR: &str = "/data/backup";
-const LEGACY_BLUEOS_DIR: &str = "/data/blueos-kernel";
-const LEGACY_SLINT_DIR: &str = "/data/slint-demo";
-const BLUEOS_MARKER: &str = ".installed-v2.txt";
 
 struct FileEntryInfo {
     name: String,
@@ -96,11 +88,6 @@ fn audit_file_type(path: &Path) -> &'static str {
 fn audit_tree(path: &Path, depth: usize, summary: &mut AuditSummary) -> IoResult<()> {
     if depth > AUDIT_MAX_DEPTH {
         summary.truncated = true;
-        println!(
-            "[SDCARD-AUDIT] truncated: maximum depth {} reached at {}",
-            AUDIT_MAX_DEPTH,
-            path.display()
-        );
         return Ok(());
     }
     if summary.entries >= AUDIT_MAX_ENTRIES {
@@ -121,469 +108,38 @@ fn audit_tree(path: &Path, depth: usize, summary: &mut AuditSummary) -> IoResult
 
         if metadata.is_dir() {
             summary.directories += 1;
-            println!("[SDCARD-AUDIT] DIR {}", child.display());
             audit_tree(&child, depth + 1, summary)?;
             continue;
         }
 
-        let file_type = if metadata.is_file() {
-            let file_type = audit_file_type(&child);
-            match file_type {
+        if metadata.is_file() {
+            match audit_file_type(&child) {
                 "TXT" => summary.txt += 1,
                 "PNG" => summary.png += 1,
                 _ => summary.other += 1,
             }
             summary.files += 1;
-            file_type
         } else {
             summary.other += 1;
-            "SPECIAL"
-        };
-        println!(
-            "[SDCARD-AUDIT] FILE {} size={} type={}",
-            child.display(),
-            metadata.len(),
-            file_type
-        );
+        }
     }
     Ok(())
 }
 
-/// Print a bounded, read-only inventory of the mounted SD card.
+/// Walk a bounded, read-only inventory of the mounted SD card. No per-file
+/// logging: the walk happens on every page open and a full listing would
+/// flood the serial console.
 fn audit_sd_card() -> IoResult<()> {
     let root = Path::new(SD_ROOT);
-    println!("[SDCARD-AUDIT] BEGIN root={}", root.display());
     let mut summary = AuditSummary::default();
     audit_tree(root, 0, &mut summary)?;
     println!(
-        "[SDCARD-AUDIT] SUMMARY dirs={} files={} txt={} png={} other={} entries={} truncated={}",
+        "[SDCARD] scan: dirs={} files={} entries={} truncated={}",
         summary.directories,
         summary.files,
-        summary.txt,
-        summary.png,
-        summary.other,
         summary.entries,
         summary.truncated
     );
-    Ok(())
-}
-
-fn metadata_if_present(path: &Path) -> IoResult<Option<fs::Metadata>> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "path has no parent"))?;
-    let name = path
-        .file_name()
-        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "path has no file name"))?;
-    let entries = match fs::read_dir(parent) {
-        Ok(entries) => entries,
-        Err(error)
-            if error.kind() == ErrorKind::NotFound
-                || error.raw_os_error() == Some(-2)
-                || error.raw_os_error() == Some(2) =>
-        {
-            return Ok(None);
-        }
-        Err(error) => return Err(error),
-    };
-    for entry in entries {
-        let entry = entry?;
-        if entry.file_name() == name {
-            return entry.metadata().map(Some);
-        }
-    }
-    Ok(None)
-}
-
-fn files_equal(left: &Path, right: &Path) -> IoResult<bool> {
-    let left_metadata = metadata_if_present(left)?;
-    let right_metadata = metadata_if_present(right)?;
-    let (Some(left_metadata), Some(right_metadata)) = (left_metadata, right_metadata) else {
-        return Ok(false);
-    };
-    if !left_metadata.is_file()
-        || !right_metadata.is_file()
-        || left_metadata.len() != right_metadata.len()
-    {
-        return Ok(false);
-    }
-
-    let mut left_file = File::open(left)?;
-    let mut right_file = File::open(right)?;
-    let mut left_buffer = [0u8; 1024];
-    let mut right_buffer = [0u8; 1024];
-    loop {
-        let left_len = left_file.read(&mut left_buffer)?;
-        let right_len = right_file.read(&mut right_buffer)?;
-        if left_len != right_len {
-            return Ok(false);
-        }
-        if left_buffer[..left_len] != right_buffer[..right_len] {
-            return Ok(false);
-        }
-        if left_len == 0 {
-            return Ok(true);
-        }
-    }
-}
-
-fn copy_file_verified(source: &Path, target: &Path) -> IoResult<()> {
-    if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let mut source_file = File::open(source)?;
-    let mut target_file = File::create(target)?;
-    let mut buffer = [0u8; 1024];
-    loop {
-        let length = source_file.read(&mut buffer)?;
-        if length == 0 {
-            break;
-        }
-        target_file.write_all(&buffer[..length])?;
-    }
-    target_file.flush()?;
-    if !files_equal(source, target)? {
-        return Err(Error::new(
-            ErrorKind::InvalidData,
-            format!("copy verification failed: {}", source.display()),
-        ));
-    }
-    Ok(())
-}
-
-fn backup_file(source: &Path, target: &Path) -> IoResult<()> {
-    if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    if metadata_if_present(target)?.is_some() {
-        if files_equal(source, target)? {
-            return Ok(());
-        }
-        return Err(Error::new(
-            ErrorKind::AlreadyExists,
-            format!("backup conflict: {}", target.display()),
-        ));
-    }
-    copy_file_verified(source, target)?;
-    println!(
-        "[SDCARD-BACKUP] saved {} -> {}",
-        source.display(),
-        target.display()
-    );
-    Ok(())
-}
-
-fn backup_tree(source: &Path, target: &Path, count: &mut usize) -> IoResult<()> {
-    if *count >= AUDIT_MAX_ENTRIES {
-        return Err(Error::new(
-            ErrorKind::InvalidData,
-            "too many files to back up",
-        ));
-    }
-    let Some(metadata) = metadata_if_present(source)? else {
-        return Ok(());
-    };
-    if metadata.is_dir() {
-        fs::create_dir_all(target)?;
-        for entry in fs::read_dir(source)? {
-            let entry = entry?;
-            let name = entry.file_name();
-            backup_tree(&entry.path(), &target.join(name), count)?;
-        }
-    } else if metadata.is_file() {
-        *count += 1;
-        backup_file(source, target)?;
-    }
-    Ok(())
-}
-
-fn migration_target(path: &Path) -> IoResult<PathBuf> {
-    let name = path
-        .file_name()
-        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "SD file has no name"))?;
-    match audit_file_type(path) {
-        "TXT" => Ok(Path::new(DOCUMENTS_DIR).join(name)),
-        "PNG" => Ok(Path::new(PICTURES_DIR).join(name)),
-        _ => Err(Error::new(
-            ErrorKind::InvalidData,
-            format!("unsupported file in legacy directory: {}", path.display()),
-        )),
-    }
-}
-
-fn collect_blueos_files(path: &Path, files: &mut Vec<PathBuf>) -> IoResult<()> {
-    if files.len() >= AUDIT_MAX_ENTRIES {
-        return Err(Error::new(
-            ErrorKind::InvalidData,
-            "too many files to migrate",
-        ));
-    }
-    for entry in fs::read_dir(path)? {
-        let entry = entry?;
-        let child = entry.path();
-        let metadata = entry.metadata()?;
-        if metadata.is_dir() {
-            collect_blueos_files(&child, files)?;
-        } else if metadata.is_file() {
-            if child.file_name().is_some_and(|name| name == BLUEOS_MARKER) {
-                continue;
-            }
-            files.push(child);
-        }
-    }
-    Ok(())
-}
-
-fn collect_root_files(files: &mut Vec<PathBuf>) -> IoResult<()> {
-    for entry in fs::read_dir(SD_ROOT)? {
-        let entry = entry?;
-        let child = entry.path();
-        if entry.metadata()?.is_file() && matches!(audit_file_type(&child), "TXT" | "PNG") {
-            files.push(child);
-        }
-    }
-    Ok(())
-}
-
-fn migrate_file(source: &Path, target: &Path) -> IoResult<()> {
-    if metadata_if_present(target)?.is_some() {
-        if !files_equal(source, target)? {
-            return Err(Error::new(
-                ErrorKind::AlreadyExists,
-                format!("migration name conflict: {}", target.display()),
-            ));
-        }
-        fs::remove_file(source)?;
-        println!(
-            "[SDCARD-MIGRATE] removed duplicate {} (same as {})",
-            source.display(),
-            target.display()
-        );
-    } else {
-        // BlueOS currently does not provide a reliable cross-directory rename.
-        // Copy and verify the file before deleting the source so a failed write
-        // cannot destroy the original data.
-        copy_file_verified(source, target)?;
-        fs::remove_file(source)?;
-        if metadata_if_present(source)?.is_some() {
-            return Err(Error::new(
-                ErrorKind::Other,
-                format!("source still exists after migration: {}", source.display()),
-            ));
-        }
-        println!(
-            "[SDCARD-MIGRATE] moved {} -> {}",
-            source.display(),
-            target.display()
-        );
-    }
-    Ok(())
-}
-
-fn remove_empty_tree(path: &Path) -> IoResult<()> {
-    let Some(metadata) = metadata_if_present(path)? else {
-        return Ok(());
-    };
-    if !metadata.is_dir() {
-        return Err(Error::new(
-            ErrorKind::InvalidData,
-            format!("expected directory: {}", path.display()),
-        ));
-    }
-    for entry in fs::read_dir(path)? {
-        let entry = entry?;
-        if entry.metadata()?.is_dir() {
-            remove_empty_tree(&entry.path())?;
-        }
-    }
-    let remaining: Vec<_> = fs::read_dir(path)?.collect::<Result<_, _>>()?;
-    if !remaining.is_empty() {
-        for entry in &remaining {
-            println!(
-                "[SDCARD-MIGRATE] cannot remove {}: remaining {}",
-                path.display(),
-                entry.path().display()
-            );
-        }
-        return Err(Error::new(
-            ErrorKind::DirectoryNotEmpty,
-            format!("directory not empty: {}", path.display()),
-        ));
-    }
-    fs::remove_dir(path)?;
-    println!("[SDCARD-MIGRATE] removed empty directory {}", path.display());
-    Ok(())
-}
-
-fn remove_tree(path: &Path) -> IoResult<()> {
-    let Some(metadata) = metadata_if_present(path)? else {
-        return Ok(());
-    };
-    if metadata.is_dir() {
-        for entry in fs::read_dir(path)? {
-            let entry = entry?;
-            let child = entry.path();
-            if entry.metadata()?.is_dir() {
-                remove_tree(&child)?;
-            } else {
-                fs::remove_file(&child)?;
-                println!("[SDCARD-MIGRATE] deleted {}", child.display());
-            }
-        }
-        fs::remove_dir(path)?;
-        println!("[SDCARD-MIGRATE] deleted directory {}", path.display());
-    } else {
-        fs::remove_file(path)?;
-        println!("[SDCARD-MIGRATE] deleted {}", path.display());
-    }
-    Ok(())
-}
-
-fn deduplicate_pictures() -> IoResult<()> {
-    let directory = Path::new(PICTURES_DIR);
-    let mut pngs = Vec::new();
-    for entry in fs::read_dir(directory)? {
-        let entry = entry?;
-        let path = entry.path();
-        if entry.metadata()?.is_file() && audit_file_type(&path) == "PNG" {
-            pngs.push(path);
-        }
-    }
-    pngs.sort_by(|left, right| {
-        left.file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .cmp(&right.file_name().unwrap_or_default().to_string_lossy())
-    });
-
-    let mut removed = vec![false; pngs.len()];
-    for index in 0..pngs.len() {
-        if removed[index] {
-            continue;
-        }
-        for duplicate in (index + 1)..pngs.len() {
-            if removed[duplicate] || !files_equal(&pngs[index], &pngs[duplicate])? {
-                continue;
-            }
-            let backup = Path::new(BACKUP_DIR)
-                .join("Pictures")
-                .join(pngs[duplicate].file_name().ok_or_else(|| {
-                    Error::new(ErrorKind::InvalidData, "PNG has no file name")
-                })?);
-            backup_file(&pngs[duplicate], &backup)?;
-            fs::remove_file(&pngs[duplicate])?;
-            removed[duplicate] = true;
-            println!(
-                "[SDCARD-MIGRATE] removed duplicate PNG {} (same as {})",
-                pngs[duplicate].display(),
-                pngs[index].display()
-            );
-        }
-    }
-    Ok(())
-}
-
-fn remove_file_if_present(path: &Path) -> IoResult<()> {
-    let Some(metadata) = metadata_if_present(path)? else {
-        return Ok(());
-    };
-    if !metadata.is_file() {
-        return Err(Error::new(
-            ErrorKind::InvalidData,
-            format!("expected file: {}", path.display()),
-        ));
-    }
-    fs::remove_file(path)?;
-    if metadata_if_present(path)?.is_some() {
-        return Err(Error::new(
-            ErrorKind::Other,
-            format!("file still exists after deletion: {}", path.display()),
-        ));
-    }
-    println!("[SDCARD-MIGRATE] deleted {}", path.display());
-    Ok(())
-}
-
-fn remove_requested_artifacts() -> IoResult<()> {
-    for path in [
-        Path::new(DOCUMENTS_DIR).join("README.txt"),
-        Path::new(PICTURES_DIR).join("10-banner.png"),
-        Path::new(PICTURES_DIR).join("11-architecture.png"),
-        Path::new(PICTURES_DIR).join("12-filesystem.png"),
-        Path::new(PICTURES_DIR).join("13-platform.png"),
-        Path::new(PICTURES_DIR).join("2-architecture.png"),
-    ] {
-        remove_file_if_present(&path)?;
-    }
-    remove_tree(Path::new(BACKUP_DIR))?;
-    println!("[SDCARD-MIGRATE] deleted backup directory {}", BACKUP_DIR);
-    Ok(())
-}
-
-fn organize_sd_card() -> IoResult<()> {
-    println!("[SDCARD-MIGRATE] BEGIN target=Documents,Pictures,Sounds");
-    fs::create_dir_all(BACKUP_DIR)?;
-    fs::create_dir_all(DOCUMENTS_DIR)?;
-    fs::create_dir_all(PICTURES_DIR)?;
-    fs::create_dir_all(SOUNDS_DIR)?;
-
-    let mut sources = Vec::new();
-    collect_root_files(&mut sources)?;
-    if let Some(metadata) = metadata_if_present(Path::new(LEGACY_BLUEOS_DIR))? {
-        if metadata.is_dir() {
-            collect_blueos_files(Path::new(LEGACY_BLUEOS_DIR), &mut sources)?;
-        }
-    }
-
-    let mut backup_count = 0;
-    backup_tree(
-        Path::new(LEGACY_BLUEOS_DIR),
-        &Path::new(BACKUP_DIR).join("blueos-kernel"),
-        &mut backup_count,
-    )?;
-    backup_tree(
-        Path::new(LEGACY_SLINT_DIR),
-        &Path::new(BACKUP_DIR).join("slint-demo"),
-        &mut backup_count,
-    )?;
-    for source in &sources {
-        if source.starts_with(Path::new(LEGACY_BLUEOS_DIR)) {
-            continue;
-        }
-        let name = source
-            .file_name()
-            .ok_or_else(|| Error::new(ErrorKind::InvalidData, "root file has no name"))?;
-        backup_file(source, &Path::new(BACKUP_DIR).join("root").join(name))?;
-        backup_count += 1;
-    }
-    println!("[SDCARD-BACKUP] verified {} files before migration", backup_count);
-
-    let mut migrations = Vec::with_capacity(sources.len());
-    for source in &sources {
-        migrations.push((source.clone(), migration_target(source)?));
-    }
-    for (source, target) in &migrations {
-        if metadata_if_present(target)?.is_some() && !files_equal(source, target)? {
-            return Err(Error::new(
-                ErrorKind::AlreadyExists,
-                format!("migration name conflict: {}", target.display()),
-            ));
-        }
-    }
-    for (source, target) in &migrations {
-        migrate_file(source, target)?;
-    }
-
-    let marker = Path::new(LEGACY_BLUEOS_DIR).join(BLUEOS_MARKER);
-    if metadata_if_present(&marker)?.is_some() {
-        fs::remove_file(&marker)?;
-        println!("[SDCARD-MIGRATE] deleted {}", marker.display());
-    }
-    remove_empty_tree(Path::new(LEGACY_BLUEOS_DIR))?;
-    remove_tree(Path::new(LEGACY_SLINT_DIR))?;
-    deduplicate_pictures()?;
-    remove_requested_artifacts()?;
-    println!("[SDCARD-MIGRATE] DONE");
     Ok(())
 }
 
@@ -953,8 +509,6 @@ pub(crate) fn install(ui: &MainWindow, png_state: SharedPngRenderState) {
     let ui_weak = ui.as_weak();
     let callback_browser = browser.clone();
     let callback_audit_done = audit_done.clone();
-    let migration_done = Rc::new(RefCell::new(false));
-    let callback_migration_done = migration_done.clone();
     ui.on_sd_page_active_changed(move |active| {
         if !active {
             // Reset PNG viewer state when leaving the SD card page
@@ -966,15 +520,9 @@ pub(crate) fn install(ui: &MainWindow, png_state: SharedPngRenderState) {
             if let Some(ui) = ui_weak.upgrade() {
                 if !*callback_audit_done.borrow() {
                     if let Err(error) = audit_sd_card() {
-                        println!("[SDCARD-AUDIT] failed: {error}");
+                        println!("[SDCARD] scan failed: {error}");
                     } else {
                         *callback_audit_done.borrow_mut() = true;
-                    }
-                }
-                if *callback_audit_done.borrow() && !*callback_migration_done.borrow() {
-                    match organize_sd_card() {
-                        Ok(()) => *callback_migration_done.borrow_mut() = true,
-                        Err(error) => println!("[SDCARD-MIGRATE] failed: {error}"),
                     }
                 }
                 callback_browser.borrow_mut().refresh(&ui);
