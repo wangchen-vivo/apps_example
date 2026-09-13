@@ -39,6 +39,13 @@ export component TouchPage inherits AppPage {
         }
 
         Rectangle {
+            x: 0px; y: 0px; width: parent.width; height: 60px;
+            background: Theme.screen-background;
+        }
+
+        // Touch dot — declared after the title-bar mask so it renders on
+        // top of it and stays visible when the pointer is in the top strip.
+        Rectangle {
             x: root.current-x - 7px;
             y: root.current-y - 7px;
             width: 14px; height: 14px;
@@ -46,12 +53,6 @@ export component TouchPage inherits AppPage {
             border-radius: 7px;
             visible: root.tracking;
         }
-
-    }
-
-    Rectangle {
-        x: 0px; y: 0px; width: parent.width; height: 60px;
-        background: Theme.screen-background;
     }
 
     Text {
