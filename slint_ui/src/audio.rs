@@ -27,17 +27,15 @@ use std::cell::{Cell, RefCell};
 use std::io::{Error, ErrorKind, Result as IoResult, Write};
 use std::rc::Rc;
 
-/// Shortened PCM audio (3 seconds, 96 KB) — the full 1 MB mood_pcm does not
-/// fit in the slint_ui_example ROM region alongside the Slint renderer.
+/// TTS PCM audio (2 seconds, 16-bit mono @ 16 kHz), same source as the
+/// audio_example app (output.wav).
 include!("audio_pcm_short.rs");
 
-/// 16kHz, 16-bit, mono → stereo, 32-bit left-justified slots.
+/// 16kHz, 16-bit, mono → 4-slot TDM, 32-bit left-justified slots.
+/// Each mono sample (2 bytes) expands to 16 bytes (4 × 32-bit slots);
+/// the sample goes into slot0's high 16 bits, slots 1-3 are zero.
 const LJ_CHUNK: usize = 4088; // 511 frames × 8 bytes
-const RAW_CHUNK: usize = LJ_CHUNK / 4; // 511 samples × 2 bytes = 1022
-const DIAGNOSTIC_TONE: bool = true;
-const DIAGNOSTIC_TONE_HZ: usize = 1_000;
-const SAMPLE_RATE_HZ: usize = 16_000;
-const DIAGNOSTIC_AMPLITUDE: i16 = 24_000;
+const RAW_CHUNK: usize = LJ_CHUNK / 8; // 511 samples × 2 bytes = 1022
 
 struct AudioPlayer {
     offset: usize,
@@ -53,31 +51,23 @@ thread_local! {
     }));
 }
 
-/// Convert mono PCM (2 bytes/sample) to I2S left-justified stereo frames.
-fn convert_to_lj(pcm_src: &[u8], lj_dst: &mut [u8], raw_len: usize, sample_offset: usize) {
-    let samples = raw_len / 2;
-    for s in 0..samples {
-        let src = s * 2;
-        let dst = s * 8;
-        let sample = if DIAGNOSTIC_TONE {
-            let half_period = SAMPLE_RATE_HZ / DIAGNOSTIC_TONE_HZ / 2;
-            if ((sample_offset + s) / half_period) & 1 == 0 {
-                DIAGNOSTIC_AMPLITUDE
-            } else {
-                -DIAGNOSTIC_AMPLITUDE
-            }
-            .to_le_bytes()
-        } else {
-            [pcm_src[src], pcm_src[src + 1]]
-        };
-        lj_dst[dst] = 0x00;
-        lj_dst[dst + 1] = 0x00;
-        lj_dst[dst + 2] = sample[0];
-        lj_dst[dst + 3] = sample[1];
-        lj_dst[dst + 4] = 0x00;
-        lj_dst[dst + 5] = 0x00;
-        lj_dst[dst + 6] = sample[0];
-        lj_dst[dst + 7] = sample[1];
+/// Convert mono PCM (2 bytes/sample) to I2S 4-slot TDM frames, same
+/// format as audio_example's play_tts: each 16-bit mono sample is
+/// left-justified into slot0's high 16 bits (4 slots × 32-bit = 16
+/// bytes per frame), slots 1-3 zero.
+fn convert_to_lj(pcm_src: &[u8], buf: &mut [u8], offset: usize, raw_len: usize) {
+    let frames = raw_len / 2;
+    for f in 0..frames {
+        let src = offset + f * 2;
+        let dst = f * 16;
+        let m = [pcm_src[src], pcm_src[src + 1]];
+        // slot 0: mono left-justified into 32-bit slot (high 16 bits)
+        buf[dst] = 0x00;
+        buf[dst + 1] = 0x00;
+        buf[dst + 2] = m[0];
+        buf[dst + 3] = m[1];
+        // slot 1-3: 0
+        buf[dst + 4..dst + 16].fill(0);
     }
 }
 
@@ -85,7 +75,7 @@ fn convert_to_lj(pcm_src: &[u8], lj_dst: &mut [u8], raw_len: usize, sample_offse
 fn playback_tick(ui: &MainWindow) {
     PLAYER.with(|player_rc| {
         let mut player = player_rc.borrow_mut();
-        let pcm = MOOD_PCM.as_slice();
+        let pcm = EXAMPLE_PCM.as_slice();
 
         // Lazily open /dev/i2s0 on first tick.
         if player.file.is_none() {
@@ -113,7 +103,7 @@ fn playback_tick(ui: &MainWindow) {
             return;
         }
 
-        let lj_len = (raw_len / 2) * 8;
+        let lj_len = (raw_len / 2) * 16;
         let chunk_index = player.offset / RAW_CHUNK;
         if chunk_index < 3 || chunk_index % 16 == 0 {
             println!(
@@ -123,8 +113,7 @@ fn playback_tick(ui: &MainWindow) {
         }
         // Copy PCM slice first to avoid borrowing player.buf while pcm borrows player.
         let pcm_chunk: Vec<u8> = pcm[player.offset..player.offset + raw_len].to_vec();
-        let sample_offset = player.offset / 2;
-        convert_to_lj(&pcm_chunk, &mut player.buf, raw_len, sample_offset);
+        convert_to_lj(&pcm_chunk, &mut player.buf, 0, raw_len);
 
         // Split borrows: take file out, write, then put back.
         let mut file_opt = player.file.take();
@@ -375,11 +364,7 @@ pub(crate) fn install(ui: &MainWindow) -> slint::Timer {
         play_controller.borrow().set_mute(true);
 
         ui.set_audio_playing(true);
-        if DIAGNOSTIC_TONE {
-            println!("[AUDIO] Play started: 1 kHz diagnostic square wave");
-        } else {
-            println!("[AUDIO] Play started: PCM music");
-        }
+        println!("[AUDIO] Play started: TTS PCM ({} bytes)", EXAMPLE_PCM.len());
 
         let unmute_ctrl = unmute_controller.clone();
         unmute_timer_play.start(
