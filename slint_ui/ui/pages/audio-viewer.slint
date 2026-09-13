@@ -1,0 +1,184 @@
+// WAV audio viewer for SD card browser.
+// Pixel-identical layout to audio-page.slint (hero card / play-stop buttons /
+// volume slider), but driven by the SD-card player state (sd-audio-*) so the
+// two entry points never disturb each other's status display. Both share the
+// same player engine and codec volume.
+// Compatible with SoftwareRenderer::render_by_line: no Path items.
+
+import { Theme } from "../components/theme.slint";
+import { Icons } from "../components/icons.slint";
+
+export component AudioViewer inherits Rectangle {
+    in property <string> audio-title;
+    in property <string> audio-status-size;
+    in property <string> audio-status;
+    in property <bool> audio-playing;
+    in-out property <int> volume;
+    callback audio-play();
+    callback audio-stop();
+    callback set-audio-volume(int);
+
+    background: Theme.screen-background;
+
+    // Hero card — same geometry as the audio page (y=92 on the full page,
+    // 30px into this viewer's area which starts at page y=62).
+    Rectangle {
+        x: 20px; y: 30px; width: parent.width - 40px; height: 88px;
+        background: Theme.card-background;
+        border-width: 1px; border-color: Theme.border-color; border-radius: 14px;
+        clip: true;
+
+        Text {
+            x: 20px; y: 0; width: 56px; height: parent.height;
+            text: Icons.music;
+            color: #6fe0bd;
+            font-family: Theme.icon-font-family;
+            font-size: Theme.font-icon;
+            horizontal-alignment: center; vertical-alignment: center;
+        }
+
+        Text {
+            x: 92px; y: 16px; width: 250px; height: 36px;
+            text: root.audio-title;
+            color: Theme.primary-text;
+            font-size: Theme.font-lg; font-weight: 800;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+
+        // File size at the card's top-right corner
+        Text {
+            x: parent.width - 108px; y: 18px; width: 92px; height: 22px;
+            text: root.audio-status-size;
+            color: Theme.muted-text;
+            font-size: Theme.font-sm;
+            horizontal-alignment: right; vertical-alignment: center;
+        }
+
+        Text {
+            x: 92px; y: 54px; width: 330px; height: 22px;
+            text: root.audio-playing ? root.audio-status : "点击播放";
+            color: Theme.muted-text;
+            font-size: Theme.font-sm;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+    }
+
+    // Play / Stop buttons — same geometry as the audio page (y=204).
+    Rectangle {
+        x: parent.width / 2 - 108px; y: 142px; width: 96px; height: 52px;
+        background: #6fe0bd; border-radius: 10px;
+
+        Text {
+            width: parent.width; height: parent.height;
+            text: "播放";
+            color: #06241c; font-size: Theme.font-base; font-weight: 700;
+            horizontal-alignment: center; vertical-alignment: center;
+        }
+
+        TouchArea {
+            clicked => { root.audio-play(); }
+        }
+    }
+
+    Rectangle {
+        x: parent.width / 2 + 12px; y: 142px; width: 96px; height: 52px;
+        background: #ff6b6b; border-radius: 10px;
+
+        Text {
+            width: parent.width; height: parent.height;
+            text: "停止";
+            color: #ffffff; font-size: Theme.font-base; font-weight: 700;
+            horizontal-alignment: center; vertical-alignment: center;
+        }
+
+        TouchArea {
+            clicked => { root.audio-stop(); }
+        }
+    }
+
+    // Volume card — same geometry as the audio page (y=276).
+    Rectangle {
+        x: 20px; y: 214px; width: parent.width - 40px; height: 108px;
+        background: Theme.card-background;
+        border-width: 1px; border-color: Theme.border-color; border-radius: 14px;
+        clip: true;
+
+        Text {
+            x: 24px; y: 18px; width: 100px; height: 28px;
+            text: "音量";
+            color: Theme.secondary-text;
+            font-size: Theme.font-sm; font-weight: 600;
+            vertical-alignment: center;
+        }
+
+        Text {
+            x: parent.width - 124px; y: 18px; width: 100px; height: 28px;
+            text: root.volume + "%";
+            color: #6fe0bd;
+            font-size: Theme.font-lg; font-weight: 800;
+            horizontal-alignment: right; vertical-alignment: center;
+        }
+
+        // Slider track
+        Rectangle {
+            x: 24px; y: 56px; width: parent.width - 48px; height: 32px;
+            background: Theme.raised-background;
+            border-width: 1px; border-color: Theme.border-color; border-radius: 10px;
+
+            // Fill
+            Rectangle {
+                x: 0; y: 0;
+                width: parent.width * root.volume / 100;
+                height: parent.height;
+                background: #6fe0bd; border-radius: 10px;
+            }
+
+            // Knob: taller than the track so it overflows top/bottom for a
+            // larger drag target (matches the audio-page slider).
+            Rectangle {
+                x: parent.width * root.volume / 100 - 16px;
+                y: -8px;
+                width: 32px; height: 48px;
+                background: vol-area.pressed ? #ffffff : #f0f0f0;
+                border-width: 2px; border-color: #6fe0bd; border-radius: 8px;
+            }
+
+            vol-area := TouchArea {
+                x: -16px; width: parent.width + 32px;
+                y: -8px; height: parent.height + 16px;
+                property <bool> dragging: false;
+                property <float> track-px: parent.width / 1px;
+                property <float> track-offset: 16.0;
+                // Slider snaps to multiples of this step.
+                property <int> volume-step: 10;
+
+                pointer-event(event) => {
+                    if event.kind == PointerEventKind.down {
+                        self.dragging = true;
+                        root.volume = clamp(
+                            round((self.mouse-x / 1px - self.track-offset) / self.track-px * 100 / self.volume-step) * self.volume-step,
+                            0, 100);
+                    }
+                    if event.kind == PointerEventKind.up {
+                        self.dragging = false;
+                        root.set-audio-volume(root.volume);
+                    }
+                }
+
+                moved => {
+                    if self.dragging {
+                        let next = clamp(
+                            round((self.mouse-x / 1px - self.track-offset) / self.track-px * 100 / self.volume-step) * self.volume-step,
+                            0, 100);
+                        if next != root.volume {
+                            root.volume = next;
+                            root.set-audio-volume(next);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

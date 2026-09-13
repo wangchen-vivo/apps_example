@@ -5,12 +5,14 @@ import { AppPage } from "../components/app-page.slint";
 import { Theme } from "../components/theme.slint";
 import { TextViewer } from "text-viewer.slint";
 import { ImageViewer } from "image-viewer.slint";
+import { AudioViewer } from "audio-viewer.slint";
 
 export struct SdFileEntry {
     name: string,
     is-dir: bool,
     can-open: bool,
     is-image: bool,
+    is-audio: bool,
     size-text: string,
 }
 
@@ -38,6 +40,21 @@ export component SdCardPage inherits AppPage {
     in-out property <bool> image-open: false;
     in-out property <string> image-title: "";
     in-out property <string> image-status: "";
+    // WAV audio viewer state — separate from the audio page's audio-* set.
+    // The player engine (I2S handle, volume) is shared, but playback status
+    // and progress are tracked per-entry so neither view disturbs the other.
+    in-out property <bool> audio-open: false;
+    in-out property <string> audio-title: "";
+    // File size while idle, then playback progress routed by the audio module.
+    in-out property <string> audio-status: "";
+    // Playback state of the SD-card WAV source (routed by audio.rs).
+    in-out property <bool> audio-playing: false;
+    in property <string> main-audio-status;
+    // Shared codec volume, bound to MainWindow's audio-volume by main.slint.
+    in-out property <int> audio-volume: 100;
+    callback audio-play();
+    callback audio-stop();
+    callback set-audio-volume(int);
     // Currently pressed row index (-1 = none). Highlighted with an accent border.
     property <int> pressed-index: -1;
 
@@ -50,15 +67,17 @@ export component SdCardPage inherits AppPage {
     callback previous-text-page();
     callback next-text-page();
     callback close-image();
+    callback close-audio();
     callback debug(string);
 
     // Dynamic bottom nav labels
+    property <bool> viewer-open: root.text-open || root.image-open || root.audio-open;
     property <bool> is-top-level: root.path-text == "/data";
-    nav-back-text: root.text-open || root.image-open ? "退出" : root.is-top-level ? "返回" : "上一层";
-    nav-home-text: root.is-top-level || root.text-open || root.image-open ? "主页" : "主页";
+    nav-back-text: root.viewer-open ? "退出" : root.is-top-level ? "返回" : "上一层";
+    nav-home-text: root.is-top-level || root.viewer-open ? "主页" : "主页";
 
     // Path bar — left: path, right: item count
-    if !root.text-open && !root.image-open: Rectangle {
+    if !root.viewer-open: Rectangle {
         x: 16px;
         y: 74px;
         width: 448px;
@@ -88,7 +107,7 @@ export component SdCardPage inherits AppPage {
     }
 
     // Empty state
-    if !root.text-open && !root.image-open && root.total-count == 0: Rectangle {
+    if !root.viewer-open && root.total-count == 0: Rectangle {
         x: 0; y: 120px; width: parent.width; height: 250px;
 
         Text {
@@ -110,20 +129,20 @@ export component SdCardPage inherits AppPage {
         y: 124px + index * 56px;
         width: 448px;
         height: 52px;
-        visible: !root.text-open && !root.image-open;
+        visible: !root.viewer-open;
 
         Rectangle {
             x: 8px;
             y: 10px;
             width: 32px;
             height: 32px;
-            background: entry.is-dir ? #284d42 : entry.is-image ? #3b405f : Theme.raised-background;
+            background: entry.is-dir ? #284d42 : entry.is-image ? #3b405f : entry.is-audio ? #4f2f5f : Theme.raised-background;
             border-radius: 8px;
             Text {
                 width: parent.width;
                 height: parent.height;
-                text: entry.is-dir ? "D" : entry.is-image ? "P" : entry.can-open ? "T" : "F";
-                color: entry.is-dir ? #6fe0bd : entry.is-image ? #aab5ff : Theme.secondary-text;
+                text: entry.is-dir ? "D" : entry.is-image ? "P" : entry.is-audio ? "A" : entry.can-open ? "T" : "F";
+                color: entry.is-dir ? #6fe0bd : entry.is-image ? #aab5ff : entry.is-audio ? #d9a6ff : Theme.secondary-text;
                 font-size: Theme.font-sm;
                 font-weight: 800;
                 horizontal-alignment: center;
@@ -147,7 +166,7 @@ export component SdCardPage inherits AppPage {
             y: 28px;
             width: 400px;
             height: 20px;
-            text: entry.is-dir ? "目录" : entry.size-text + (entry.is-image ? "  PNG" : entry.can-open ? "  文本" : "");
+            text: entry.is-dir ? "目录" : entry.size-text + (entry.is-image ? "  PNG" : entry.is-audio ? "  WAV" : entry.can-open ? "  文本" : "");
             color: Theme.muted-text;
             font-size: Theme.font-sm;
             vertical-alignment: center;
@@ -158,7 +177,7 @@ export component SdCardPage inherits AppPage {
     // on top of row content. Kept outside the for-repeater so changing
     // pressed-index only dirties this one rectangle, not every row.
     // Transparent fill: only the accent border highlights, content shows through.
-    if root.pressed-index >= 0 && !root.text-open && !root.image-open: Rectangle {
+    if root.pressed-index >= 0 && !root.viewer-open: Rectangle {
         x: 16px;
         y: 124px + root.pressed-index * 56px;
         width: 448px;
@@ -174,7 +193,7 @@ export component SdCardPage inherits AppPage {
     // Rows start at y=124px with 56px spacing, x spans 16..464px.
     tap(mx, my) => {
         root.debug("SD tap mx=" + mx + " my=" + my);
-        if !root.text-open && !root.image-open && root.total-count > 0 {
+        if !root.viewer-open && root.total-count > 0 {
             if mx >= 16.0 && mx < 464.0 && my >= 124.0 && my < 124.0 + root.visible-count * 56.0 {
                 let index = (my - 124.0) / 56.0;
                 root.debug("SD tap -> entry " + index);
@@ -185,7 +204,7 @@ export component SdCardPage inherits AppPage {
 
     // Press/release highlight — down on a row highlights its border.
     press(mx, my) => {
-        if !root.text-open && !root.image-open && root.total-count > 0 {
+        if !root.viewer-open && root.total-count > 0 {
             if mx >= 16.0 && mx < 464.0 && my >= 124.0 && my < 124.0 + root.visible-count * 56.0 {
                 root.pressed-index = (my - 124.0) / 56.0;
             }
@@ -218,5 +237,23 @@ export component SdCardPage inherits AppPage {
         image-title: root.image-title;
         image-status: root.image-status;
         close-image => { root.close-image(); }
+    }
+
+    // WAV audio viewer — pixel-identical controls to the audio page
+    // (hero card / play-stop buttons / volume slider), but driven by the
+    // SD-card player state (sd-audio-*), independent from the audio page.
+    if root.audio-open: AudioViewer {
+        x: 0px;
+        y: 62px;
+        width: parent.width;
+        height: parent.height - 62px - 56px;
+        audio-title: root.audio-title;
+        audio-status-size: root.audio-status;
+        audio-status: root.main-audio-status;
+        audio-playing: root.audio-playing;
+        volume <=> root.audio-volume;
+        audio-play => { root.audio-play(); }
+        audio-stop => { root.audio-stop(); }
+        set-audio-volume(value) => { root.set-audio-volume(value); }
     }
 }

@@ -118,6 +118,10 @@ export component MainWindow inherits Window {
     in-out property <bool> sd-image-open: false;
     in-out property <string> sd-image-title: "";
     in-out property <string> sd-image-status: "";
+    in-out property <bool> sd-audio-open: false;
+    in-out property <string> sd-audio-title: "";
+    in-out property <string> sd-audio-status: "";
+    in-out property <bool> sd-audio-playing: false;
     // Audio page properties
     in-out property <string> audio-status: "点击播放";
     in-out property <bool> audio-playing: false;
@@ -136,6 +140,7 @@ export component MainWindow inherits Window {
     callback sd-previous-text-page();
     callback sd-next-text-page();
     callback sd-close-image();
+    callback sd-close-audio();
 
     changed current-app => {
         root.battery-active-changed(root.current-app == 7);
@@ -146,6 +151,7 @@ export component MainWindow inherits Window {
         root.audio-page-active-changed(root.current-app == 15);
         if root.current-app != 13 {
             root.sd-image-open = false;
+            root.sd-audio-open = false;
         }
     }
 
@@ -266,12 +272,24 @@ export component MainWindow inherits Window {
         image-title <=> root.sd-image-title;
         image-status <=> root.sd-image-status;
         close-image => { root.sd-close-image(); }
+        audio-open <=> root.sd-audio-open;
+        audio-title <=> root.sd-audio-title;
+        audio-status <=> root.sd-audio-status;
+        audio-playing <=> root.sd-audio-playing;
+        main-audio-status: root.audio-status;
+        audio-volume <=> root.audio-volume;
+        audio-play => { root.audio-play(); }
+        audio-stop => { root.audio-stop(); }
+        set-audio-volume(value) => { root.set-audio-volume(value); }
+        close-audio => { root.sd-close-audio(); }
         debug(msg) => { root.debug(msg); }
         gesture-debug(msg) => { root.debug(msg); }
         swipe-right(dx, dy) => {
             root.debug("GL swipe-right dx=" + dx + " dy=" + dy);
             if root.sd-image-open {
                 root.sd-close-image();
+            } else if root.sd-audio-open {
+                root.sd-close-audio();
             } else if root.sd-text-open {
                 root.sd-close-text();
             } else if root.sd-path-text != "/data" {
@@ -299,6 +317,8 @@ export component MainWindow inherits Window {
         go-back => {
             if root.sd-image-open {
                 root.sd-close-image();
+            } else if root.sd-audio-open {
+                root.sd-close-audio();
             } else if root.sd-text-open {
                 root.sd-close-text();
             } else if root.sd-path-text != "/data" {

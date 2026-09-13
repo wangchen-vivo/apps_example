@@ -24,12 +24,112 @@ use crate::app_window::MainWindow;
 use librs::syscall::Syscall;
 use slint::ComponentHandle;
 use std::cell::{Cell, RefCell};
-use std::io::{Error, ErrorKind, Result as IoResult, Write};
+use std::io::{Error, ErrorKind, Read as _, Result as IoResult, Write};
 use std::rc::Rc;
 
 /// TTS PCM audio (2 seconds, 16-bit mono @ 16 kHz), same source as the
 /// audio_example app (output.wav).
 include!("audio_pcm_short.rs");
+
+/// Where the played PCM comes from. The audio page plays the built-in PCM;
+/// the SD card browser starts playback from a WAV file on the card.
+pub(crate) enum AudioSource {
+    Builtin,
+    /// Path to a 16-bit mono 16 kHz WAV on the SD card.
+    File { path: String, pcm_len: usize },
+}
+
+impl AudioSource {
+    fn total_len(&self) -> usize {
+        match self {
+            AudioSource::Builtin => EXAMPLE_PCM.len(),
+            AudioSource::File { pcm_len, .. } => *pcm_len,
+        }
+    }
+
+    fn label(&self) -> String {
+        match self {
+            AudioSource::Builtin => "内置 TTS".to_string(),
+            AudioSource::File { path, .. } => path.clone(),
+        }
+    }
+
+    fn clone(&self) -> AudioSource {
+        match self {
+            AudioSource::Builtin => AudioSource::Builtin,
+            AudioSource::File { path, pcm_len } => AudioSource::File {
+                path: path.clone(),
+                pcm_len: *pcm_len,
+            },
+        }
+    }
+}
+
+/// Parse a RIFF WAVE header. Returns the byte length of the PCM data chunk.
+/// Only 16-bit mono 16 kHz PCM is accepted, matching the fixed I2S TDM
+/// configuration (4 slots × 32-bit, slot0 = mono sample).
+pub(crate) fn inspect_wav(path: &str) -> IoResult<usize> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut header = [0u8; 12];
+    file.read_exact(&mut header)?;
+    if &header[0..4] != b"RIFF" || &header[8..12] != b"WAVE" {
+        return Err(Error::new(ErrorKind::InvalidData, "not a RIFF/WAVE file"));
+    }
+    let mut pcm_len = None;
+    loop {
+        let mut chunk = [0u8; 8];
+        match file.read_exact(&mut chunk) {
+            Ok(()) => {}
+            Err(e) if e.kind() == ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e),
+        }
+        let id = &chunk[0..4];
+        let size = u32::from_le_bytes(chunk[4..8].try_into().unwrap()) as usize;
+        if id == b"fmt " {
+            let mut fmt = [0u8; 16];
+            if size < 16 {
+                return Err(Error::new(ErrorKind::InvalidData, "fmt chunk too small"));
+            }
+            file.read_exact(&mut fmt)?;
+            // Skip the rest of an extended fmt chunk.
+            for _ in 16..size {
+                let mut byte = [0u8; 1];
+                file.read_exact(&mut byte)?;
+            }
+            let audio_format = u16::from_le_bytes(fmt[0..2].try_into().unwrap());
+            let channels = u16::from_le_bytes(fmt[2..4].try_into().unwrap());
+            let sample_rate = u32::from_le_bytes(fmt[4..8].try_into().unwrap());
+            let bits = u16::from_le_bytes(fmt[14..16].try_into().unwrap());
+            if audio_format != 1 {
+                return Err(Error::new(ErrorKind::InvalidData, "not PCM (format != 1)"));
+            }
+            if channels != 1 {
+                return Err(Error::new(ErrorKind::InvalidData, "only mono WAV supported"));
+            }
+            if sample_rate != 16_000 {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    format!("sample rate {sample_rate} != 16000"),
+                ));
+            }
+            if bits != 16 {
+                return Err(Error::new(ErrorKind::InvalidData, "only 16-bit WAV supported"));
+            }
+        } else if id == b"data" {
+            pcm_len = Some(size);
+            break;
+        } else {
+            // Skip unknown chunk (round up to even alignment per RIFF spec).
+            let skip = size.div_ceil(2) * 2;
+            let taken = std::io::copy(&mut (&mut file).take(skip as u64), &mut std::io::sink())?;
+            if taken != skip as u64 {
+                return Err(Error::new(ErrorKind::UnexpectedEof, "truncated WAV chunk"));
+            }
+        }
+    }
+    pcm_len.ok_or_else(|| Error::new(ErrorKind::InvalidData, "no data chunk found"))
+}
 
 /// 16kHz, 16-bit, mono → 4-slot TDM, 32-bit left-justified slots.
 /// Each mono sample (2 bytes) expands to 16 bytes (4 × 32-bit slots);
@@ -40,15 +140,36 @@ const RAW_CHUNK: usize = LJ_CHUNK / 8; // 511 samples × 2 bytes = 1022
 struct AudioPlayer {
     offset: usize,
     buf: Vec<u8>,
+    /// Handle to /dev/i2s0 while playing.
     file: Option<std::fs::File>,
+    /// Handle to the source WAV on the SD card (AudioSource::File only),
+    /// already seeked to the start of the data chunk.
+    wav_file: Option<std::fs::File>,
+    source: AudioSource,
+}
+
+impl AudioPlayer {
+    fn new() -> Self {
+        Self {
+            offset: 0,
+            buf: vec![0u8; LJ_CHUNK],
+            file: None,
+            wav_file: None,
+            source: AudioSource::Builtin,
+        }
+    }
 }
 
 thread_local! {
-    static PLAYER: Rc<RefCell<AudioPlayer>> = Rc::new(RefCell::new(AudioPlayer {
-        offset: 0,
-        buf: vec![0u8; LJ_CHUNK],
-        file: None,
-    }));
+    static PLAYER: Rc<RefCell<AudioPlayer>> = Rc::new(RefCell::new(AudioPlayer::new()));
+    /// Shared volume controller, installed once by `install()` and used by
+    /// both the audio page and the SD card WAV player.
+    static VOLUME_CONTROLLER: RefCell<Option<Rc<RefCell<AudioVolumeController>>>> =
+        const { RefCell::new(None) };
+    /// Unmute timer for the shared start sequence. Must outlive the callback:
+    /// a dropped Slint timer cancels its pending callback, which would leave
+    /// the DAC muted forever.
+    static UNMUTE_TIMER: slint::Timer = slint::Timer::default();
 }
 
 /// Convert mono PCM (2 bytes/sample) to I2S 4-slot TDM frames, same
@@ -75,7 +196,7 @@ fn convert_to_lj(pcm_src: &[u8], buf: &mut [u8], offset: usize, raw_len: usize) 
 fn playback_tick(ui: &MainWindow) {
     PLAYER.with(|player_rc| {
         let mut player = player_rc.borrow_mut();
-        let pcm = EXAMPLE_PCM.as_slice();
+        let total = player.source.total_len();
 
         // Lazily open /dev/i2s0 on first tick.
         if player.file.is_none() {
@@ -86,20 +207,24 @@ fn playback_tick(ui: &MainWindow) {
                 }
                 Err(e) => {
                     println!("[AUDIO] Cannot open /dev/i2s0: {}", e);
-                    ui.set_audio_status(format!("打开 I2S 失败: {}", e).into());
+                    set_status(ui, &player.source, format!("打开 I2S 失败: {}", e));
+                    set_playing(ui, &player.source, false);
                     return;
                 }
             }
         }
 
-        let raw_len = RAW_CHUNK.min(pcm.len() - player.offset) & !1;
+        // Fetch the next raw PCM chunk: slice from the built-in buffer or
+        // read from the source WAV file on the SD card.
+        let raw_len = RAW_CHUNK.min(total - player.offset) & !1;
         if raw_len == 0 {
             // Playback complete — close /dev/i2s0 so the kernel drains the
             // TX ring and stops the DMA engine (File drop → close → drain_and_stop).
             println!("[AUDIO] Playback complete ({} bytes)", player.offset);
-            ui.set_audio_status("播放完成".into());
-            ui.set_audio_playing(false);
+            set_status(ui, &player.source, "播放完成".to_string());
+            set_playing(ui, &player.source, false);
             drop(player.file.take());
+            drop(player.wav_file.take());
             return;
         }
 
@@ -112,7 +237,27 @@ fn playback_tick(ui: &MainWindow) {
             );
         }
         // Copy PCM slice first to avoid borrowing player.buf while pcm borrows player.
-        let pcm_chunk: Vec<u8> = pcm[player.offset..player.offset + raw_len].to_vec();
+        let is_file_source = matches!(player.source, AudioSource::File { .. });
+        let pcm_chunk: Vec<u8> = if !is_file_source {
+            let pcm = EXAMPLE_PCM.as_slice();
+            pcm[player.offset..player.offset + raw_len].to_vec()
+        } else if let Some(wav) = player.wav_file.as_mut() {
+            let mut chunk = vec![0u8; raw_len];
+            if let Err(e) = wav.read_exact(&mut chunk) {
+                println!("[AUDIO] WAV read error at {}: {}", player.offset, e);
+                set_status(ui, &player.source, format!("读取 WAV 失败: {}", e));
+                set_playing(ui, &player.source, false);
+                drop(player.file.take());
+                drop(player.wav_file.take());
+                return;
+            }
+            chunk
+        } else {
+            set_status(ui, &player.source, "WAV 文件未打开".to_string());
+            set_playing(ui, &player.source, false);
+            drop(player.file.take());
+            return;
+        };
         convert_to_lj(&pcm_chunk, &mut player.buf, 0, raw_len);
 
         // Split borrows: take file out, write, then put back.
@@ -128,8 +273,8 @@ fn playback_tick(ui: &MainWindow) {
                 player.offset += raw_len;
                 // Update status periodically
                 if player.offset % (16 * RAW_CHUNK) < RAW_CHUNK {
-                    let pct = player.offset * 100 / pcm.len();
-                    ui.set_audio_status(format!("播放中… {}%", pct).into());
+                    let pct = player.offset * 100 / total;
+                    set_status(ui, &player.source, format!("播放中… {}%", pct));
                 }
             }
             Err(e) => {
@@ -137,11 +282,28 @@ fn playback_tick(ui: &MainWindow) {
                     "[AUDIO] Write error: chunk={} pcm_offset={} raw_len={} i2s_len={} error={}",
                     chunk_index, player.offset, raw_len, lj_len, e
                 );
-                ui.set_audio_status(format!("播放错误: {}", e).into());
-                ui.set_audio_playing(false);
+                set_status(ui, &player.source, format!("播放错误: {}", e));
+                set_playing(ui, &player.source, false);
             }
         }
     });
+}
+
+/// Route a playback status update to the UI that owns the current source:
+/// the audio page for the built-in PCM, the SD card viewer for WAV files.
+fn set_status(ui: &MainWindow, source: &AudioSource, text: String) {
+    match source {
+        AudioSource::Builtin => ui.set_audio_status(text.into()),
+        AudioSource::File { .. } => ui.set_sd_audio_status(text.into()),
+    }
+}
+
+/// Route the playing flag to the UI that owns the current source.
+fn set_playing(ui: &MainWindow, source: &AudioSource, playing: bool) {
+    match source {
+        AudioSource::Builtin => ui.set_audio_playing(playing),
+        AudioSource::File { .. } => ui.set_sd_audio_playing(playing),
+    }
 }
 
 const AUDIO_VOLUME_DEVICE: &[u8] = b"/dev/audio_volume\0";
@@ -337,6 +499,7 @@ pub(crate) fn install(ui: &MainWindow) -> slint::Timer {
             Rc::new(RefCell::new(AudioVolumeController::disabled()))
         }
     };
+    VOLUME_CONTROLLER.with(|slot| *slot.borrow_mut() = Some(volume_controller.clone()));
 
     let vol_ui_weak = ui.as_weak();
     let vol_controller = volume_controller.clone();
@@ -364,6 +527,7 @@ pub(crate) fn install(ui: &MainWindow) -> slint::Timer {
     let unmute_timer = slint::Timer::default();
     let unmute_timer = Rc::new(unmute_timer);
     let unmute_timer_play = unmute_timer.clone();
+
     ui.on_audio_play(move || {
         let ui = match ui_weak.upgrade() {
             Some(ui) => ui,
@@ -375,29 +539,13 @@ pub(crate) fn install(ui: &MainWindow) -> slint::Timer {
             return;
         }
 
-        // Reset player state
+        // The audio page always plays the built-in PCM.
         PLAYER.with(|p| {
             let mut player = p.borrow_mut();
-            player.offset = 0;
-            player.file = None;
+            *player = AudioPlayer::new();
         });
 
-        // Mute the DAC before starting DMA so the I2S startup pop is
-        // suppressed. The one-shot timer unmutes after the DMA ring has
-        // had time to fill and the DAC output has settled.
-        play_controller.borrow().set_mute(true);
-
-        ui.set_audio_playing(true);
-        println!("[AUDIO] Play started: TTS PCM ({} bytes)", EXAMPLE_PCM.len());
-
-        let unmute_ctrl = unmute_controller.clone();
-        unmute_timer_play.start(
-            slint::TimerMode::SingleShot,
-            std::time::Duration::from_millis(30),
-            move || {
-                unmute_ctrl.borrow().set_mute(false);
-            },
-        );
+        start_playback(&ui, &format!("TTS PCM ({} bytes)", EXAMPLE_PCM.len()));
     });
 
     let stop_controller = volume_controller.clone();
@@ -407,13 +555,21 @@ pub(crate) fn install(ui: &MainWindow) -> slint::Timer {
             None => return,
         };
 
-        ui.set_audio_playing(false);
+        // Clear the flag of whichever UI owns the current source.
+        PLAYER.with(|p| {
+            let source = p.borrow().source.clone();
+            set_playing(&ui, &source, false);
+        });
         ui.set_audio_status("已停止".into());
         // Mute before draining so the stop transition is silent.
         stop_controller.borrow().set_mute(true);
         // Drop the I2S file handle so the kernel drains the TX ring and
         // stops the DMA engine (File drop → close → drain_and_stop).
-        PLAYER.with(|p| drop(p.borrow_mut().file.take()));
+        PLAYER.with(|p| {
+            let mut player = p.borrow_mut();
+            drop(player.file.take());
+            drop(player.wav_file.take());
+        });
         println!("[AUDIO] Stopped");
     });
 
@@ -436,4 +592,88 @@ pub(crate) fn install(ui: &MainWindow) -> slint::Timer {
     );
 
     timer
+}
+
+/// Common start sequence for both sources: mute the DAC, mark playing, then
+/// unmute once the DMA ring has filled. The caller must have reset PLAYER.
+/// Common start sequence for both sources: mute the DAC, mark playing, then
+/// unmute once the DMA ring has filled. The caller must have reset PLAYER.
+/// The playing flag goes to the UI that owns the current source.
+fn start_playback(ui: &MainWindow, label: &str) {
+    VOLUME_CONTROLLER.with(|slot| {
+        if let Some(controller) = slot.borrow().as_ref() {
+            // Mute the DAC before starting DMA so the I2S startup pop is
+            // suppressed. The one-shot timer unmutes after the DMA ring has
+            // had time to fill and the DAC output has settled.
+            controller.borrow().set_mute(true);
+        }
+    });
+
+    PLAYER.with(|p| {
+        let source = p.borrow().source.clone();
+        set_playing(ui, &source, true);
+    });
+    println!("[AUDIO] Play started: {}", label);
+
+    UNMUTE_TIMER.with(|timer| {
+        timer.start(
+            slint::TimerMode::SingleShot,
+            std::time::Duration::from_millis(30),
+            || {
+                VOLUME_CONTROLLER.with(|slot| {
+                    if let Some(controller) = slot.borrow().as_ref() {
+                        controller.borrow().set_mute(false);
+                    }
+                });
+            },
+        );
+    });
+}
+
+/// Seek a freshly opened WAV file to the start of its data chunk.
+/// `inspect_wav` already validated the format; this only walks chunks.
+fn skip_wav_to_data(file: &mut std::fs::File) -> IoResult<()> {
+    use std::io::Read;
+    let mut header = [0u8; 12];
+    file.read_exact(&mut header)?;
+    loop {
+        let mut chunk = [0u8; 8];
+        file.read_exact(&mut chunk)?;
+        let id = &chunk[0..4];
+        let size = u32::from_le_bytes(chunk[4..8].try_into().unwrap()) as u64;
+        if id == b"data" {
+            return Ok(());
+        }
+        let skip = size.div_ceil(2) * 2;
+        let taken = std::io::copy(&mut file.take(skip), &mut std::io::sink())?;
+        if taken != skip {
+            return Err(Error::new(ErrorKind::UnexpectedEof, "truncated WAV chunk"));
+        }
+    }
+}
+
+/// Entry point for the SD card browser: play a WAV file from the card.
+/// Returns Err with a user-readable reason when the file is not a
+/// supported WAV (16-bit mono 16 kHz PCM). Status updates go to the SD
+/// card viewer (`sd-audio-*` properties), not the audio page.
+pub(crate) fn play_file(ui: &MainWindow, path: &str) -> IoResult<()> {
+    if PLAYER.with(|p| p.borrow().file.is_some()) {
+        return Err(Error::new(ErrorKind::Other, "正在播放中"));
+    }
+    let pcm_len = inspect_wav(path)?;
+    let mut wav_file = std::fs::File::open(path)?;
+    skip_wav_to_data(&mut wav_file)?;
+
+    PLAYER.with(|p| {
+        let mut player = p.borrow_mut();
+        *player = AudioPlayer::new();
+        player.source = AudioSource::File {
+            path: path.to_string(),
+            pcm_len,
+        };
+        player.wav_file = Some(wav_file);
+    });
+
+    start_playback(ui, path);
+    Ok(())
 }

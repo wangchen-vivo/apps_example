@@ -39,6 +39,7 @@ action("generate_slint_ui") {
     "ui/pages/sd-card-page.slint",
     "ui/pages/text-viewer.slint",
     "ui/pages/image-viewer.slint",
+    "ui/pages/audio-viewer.slint",
     "ui/pages/wifi-scan-page.slint",
     "ui/pages/imu-page.slint",
     "ui/pages/battery-page.slint",

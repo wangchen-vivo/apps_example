@@ -687,15 +687,17 @@ impl SdBrowser {
         let rows: Vec<SdFileEntry> = self.entries[self.scroll_offset..visible_end]
             .iter()
             .map(|entry| {
-                let is_text = !entry.is_dir && extension_is(&entry.name, "txt");
-                let is_image = !entry.is_dir && extension_is(&entry.name, "png");
-                SdFileEntry {
-                    name: entry.name.as_str().into(),
-                    is_dir: entry.is_dir,
-                    can_open: entry.is_dir || is_text || is_image,
-                    is_image,
-                    size_text: format_size(entry.size).into(),
-                }
+            let is_text = !entry.is_dir && extension_is(&entry.name, "txt");
+            let is_image = !entry.is_dir && extension_is(&entry.name, "png");
+            let is_audio = !entry.is_dir && extension_is(&entry.name, "wav");
+            SdFileEntry {
+                name: entry.name.as_str().into(),
+                is_dir: entry.is_dir,
+                can_open: entry.is_dir || is_text || is_image || is_audio,
+                is_image,
+                is_audio,
+                size_text: format_size(entry.size).into(),
+            }
             })
             .collect();
         replace_entry_rows(ui, rows);
@@ -764,9 +766,38 @@ impl SdBrowser {
             self.open_text_file(ui, &path, &name, size);
         } else if extension_is(&name, "png") {
             self.open_image_file(ui, &path, &name, size);
+        } else if extension_is(&name, "wav") {
+            self.open_audio_file(ui, &path, &name, size);
         } else {
-            ui.set_sd_status_text("只能打开 TXT 文件".into());
+            ui.set_sd_status_text("只能打开 TXT/PNG/WAV 文件".into());
         }
+    }
+
+    /// Open a WAV from the SD card: validate the header, then reuse the
+    /// audio page's player (audio.rs) via its play_file entry point. The
+    /// browser switches to the audio viewer panel while playing.
+    fn open_audio_file(&self, ui: &MainWindow, path: &str, name: &str, size: u64) {
+        match crate::audio::play_file(ui, path) {
+            Ok(()) => {
+                ui.set_sd_audio_title(name.into());
+                ui.set_sd_audio_status(format_size(size).into());
+                ui.set_sd_audio_open(true);
+                println!("[SDCARD] opened WAV {path}");
+            }
+            Err(error) => {
+                println!("[SDCARD] failed to open WAV {path}: {error}");
+                ui.set_sd_status_text(format!("WAV 打开失败: {error}").into());
+            }
+        }
+    }
+
+    fn close_audio(&self, ui: &MainWindow) {
+        // Stop playback and restore the directory rows. The audio module's
+        // stop flow is driven through the shared audio-stop callback so the
+        // TX ring drains through the same path as the audio page.
+        ui.invoke_audio_stop();
+        ui.set_sd_audio_open(false);
+        self.update_visible_entries(ui);
     }
 
     fn open_text_file(&mut self, ui: &MainWindow, path: &str, name: &str, size: u64) {
@@ -1020,6 +1051,14 @@ pub(crate) fn install(ui: &MainWindow, png_state: SharedPngRenderState) {
     ui.on_sd_close_image(move || {
         if let Some(ui) = ui_weak.upgrade() {
             callback_browser.borrow_mut().close_image(&ui);
+        }
+    });
+
+    let ui_weak = ui.as_weak();
+    let callback_browser = browser.clone();
+    ui.on_sd_close_audio(move || {
+        if let Some(ui) = ui_weak.upgrade() {
+            callback_browser.borrow_mut().close_audio(&ui);
         }
     });
 }
