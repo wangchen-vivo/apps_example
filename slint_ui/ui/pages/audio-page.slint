@@ -135,11 +135,15 @@ export component AudioPage inherits AppPage {
                 property <bool> dragging: false;
                 property <float> track-px: parent.width / 1px;
                 property <float> track-offset: 16.0;
+                // Slider snaps to multiples of this step.
+                property <int> volume-step: 10;
 
                 pointer-event(event) => {
                     if event.kind == PointerEventKind.down {
                         self.dragging = true;
-                        root.volume = clamp(round((self.mouse-x / 1px - self.track-offset) / self.track-px * 100), 0, 100);
+                        root.volume = clamp(
+                            round((self.mouse-x / 1px - self.track-offset) / self.track-px * 100 / self.volume-step) * self.volume-step,
+                            0, 100);
                     }
                     if event.kind == PointerEventKind.up {
                         self.dragging = false;
@@ -149,7 +153,9 @@ export component AudioPage inherits AppPage {
 
                 moved => {
                     if self.dragging {
-                        let next = clamp(round((self.mouse-x / 1px - self.track-offset) / self.track-px * 100), 0, 100);
+                        let next = clamp(
+                            round((self.mouse-x / 1px - self.track-offset) / self.track-px * 100 / self.volume-step) * self.volume-step,
+                            0, 100);
                         if next != root.volume {
                             root.volume = next;
                             root.set-audio-volume(next);

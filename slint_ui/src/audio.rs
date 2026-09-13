@@ -246,13 +246,28 @@ impl AudioVolumeController {
     }
 
     /// Set the volume from a 0-100 percentage value.
+    ///
+    /// 100% maps to 217 (0xD9, ~85% of the codec's full scale) — the PA
+    /// clips badly above that, so the top of the register range is kept
+    /// out of the UI's 100%.
+    ///
+    /// Measured on this board: register values below 78 (~-10 dB rel full
+    /// scale) are inaudible through the speaker. 0% is true mute (reg 0);
+    /// 1% lands directly at that audibility floor and 1-100% spreads
+    /// quadratically across the audible window so the low end is usable
+    /// instead of dying into the threshold.
     fn set(&self, pct: u8) {
         let pct = pct.min(100);
         if self.last_set.get() == Some(pct) {
             return;
         }
-        // Map 0-100% to the codec's 0-255 range. The +50 rounds to nearest.
-        let hw_value = ((pct as u16 * 255 + 50) / 100) as u8;
+        // 0 = mute; 1..100 -> 78 + 139 * ((pct-1)/99)²
+        let hw_value = if pct == 0 {
+            0
+        } else {
+            let t = (pct as u32 - 1) * (pct as u32 - 1);
+            (78 + (139 * t / (99 * 99))) as u8
+        };
         println!("[AUDIO_VOL] set {} ({}%)", hw_value, pct);
         let Some(fd) = self.fd.as_ref() else {
             return;
@@ -286,7 +301,16 @@ impl AudioVolumeController {
         };
         match fd.read_volume() {
             Ok(hw_value) => {
-                let pct = ((hw_value as u16 * 100 + 127) / 255) as u8;
+                // Inverse of set()'s audible-window quadratic:
+                // reg 0 -> 0%, 1..78 -> 1%, 79..217 -> 1 + 99·√((reg-78)/139).
+                let pct = if hw_value == 0 {
+                    0
+                } else if hw_value <= 78 {
+                    1
+                } else {
+                    let t = ((hw_value as u32 - 78) * 99 * 99 / 139) as f32;
+                    (1 + t.sqrt() as u32).min(100) as u8
+                };
                 println!("[AUDIO_VOL] read {} ({}%)", hw_value, pct);
                 pct
             }
