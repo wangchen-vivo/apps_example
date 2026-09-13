@@ -162,7 +162,6 @@ export component MainWindow inherits Window {
         open-app(app-id) => { root.current-app = app-id; }
         swipe-left(dx, dy) => { if root.current-tab < 1 { root.current-tab = 1; root.tab-offset = 1.0; } }
         swipe-right(dx, dy) => { if root.current-tab > 0 { root.current-tab = 0; root.tab-offset = 0.0; } }
-        debug(msg) => { root.debug(msg); }
     }
 
     // App pages — all inherit AppPage which provides swipe-left/right/up/down callbacks.

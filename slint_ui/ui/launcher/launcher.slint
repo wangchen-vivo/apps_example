@@ -13,7 +13,6 @@ export component Launcher inherits Rectangle {
     callback swipe-right(float, float);
     callback swipe-up(float, float);
     callback swipe-down(float, float);
-    callback debug(string);
     in-out property <int> current-tab: 0;
     in-out property <float> tab-offset: 0.0;
 
@@ -201,7 +200,6 @@ export component Launcher inherits Rectangle {
         // page 1: content-x = mx + 480
         let c = mx + root.tab-offset * 480.0;
         let inset = 12.0;
-        root.debug("tap-at: mx=" + mx + " my=" + my + " c=" + c + " page=" + page);
         if page == 0 {
             // col 0 (x=24): range [24+inset, 144-inset] = [36, 132]
             if c >= 36.0 && c < 132.0 {
