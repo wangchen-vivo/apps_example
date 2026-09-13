@@ -39,18 +39,16 @@ export component GestureLayer inherits Rectangle {
                 self.start-x = self.mouse-x;
                 self.start-y = self.mouse-y;
                 self.tracking = true;
-                root.debug("GL down x=" + (self.mouse-x / 1px) + " y=" + (self.mouse-y / 1px));
                 root.press(self.mouse-x / 1px, self.mouse-y / 1px);
             }
             if event.kind == PointerEventKind.move && self.tracking {
-                root.debug("GL move x=" + (self.mouse-x / 1px) + " y=" + (self.mouse-y / 1px));
+                // no per-move logging: too chatty for the serial console
             }
             if event.kind == PointerEventKind.up && self.tracking {
                 let dx = self.mouse-x - self.start-x;
                 let dy = self.mouse-y - self.start-y;
                 let abs-dx = dx < 0px ? -dx : dx;
                 let abs-dy = dy < 0px ? -dy : dy;
-                root.debug("GL up dx=" + (dx / 1px) + " dy=" + (dy / 1px) + " adx=" + (abs-dx / 1px) + " ady=" + (abs-dy / 1px));
 
                 if abs-dx >= 20px || abs-dy >= 20px {
                     // Require horizontal motion to be clearly dominant (>= 2× vertical)

@@ -285,7 +285,6 @@ export component MainWindow inherits Window {
         debug(msg) => { root.debug(msg); }
         gesture-debug(msg) => { root.debug(msg); }
         swipe-right(dx, dy) => {
-            root.debug("GL swipe-right dx=" + dx + " dy=" + dy);
             if root.sd-image-open {
                 root.sd-close-image();
             } else if root.sd-audio-open {
@@ -299,7 +298,6 @@ export component MainWindow inherits Window {
             }
         }
         swipe-up(dx, dy) => {
-            root.debug("GL swipe-up dx=" + dx + " dy=" + dy);
             if root.sd-text-open {
                 root.sd-next-text-page();
             } else {
@@ -307,7 +305,6 @@ export component MainWindow inherits Window {
             }
         }
         swipe-down(dx, dy) => {
-            root.debug("GL swipe-down dx=" + dx + " dy=" + dy);
             if root.sd-text-open {
                 root.sd-previous-text-page();
             } else {

@@ -503,14 +503,13 @@ impl MetalsFetcher {
     fn fetch_prices(&mut self, ui: &MainWindow) {
         match http_get(HTTP_PROXY_IP, HTTP_PROXY_PORT, HTTP_PATH, HTTP_HOST) {
             Ok((200, head, body)) => {
-                println!("TENCENT 200");
+                println!("HTTP RESPONSE 200");
                 if let Some(ts) = parse_date_header(&head) {
                     self.clock.sync(ts);
                     if let Some(hm) = self.clock.now_hhmm() {
                         ui.set_metals_time(hm.clone().into());
                         self.last_minute = Some(hm);
                     }
-                    println!("TIME OK");
                 }
                 if let Some(gold) = extract_tencent_price(&body, "hf_XAU") {
                     ui.set_metals_xau(gold.into());
@@ -521,11 +520,11 @@ impl MetalsFetcher {
                 ui.set_metals_status("".into());
             }
             Ok((code, _, _)) => {
-                println!("TENCENT !200");
+                println!("HTTP RESPONSE {}", code);
                 ui.set_metals_status(format!("HTTP 状态 {}", code).into());
             }
             Err(err) => {
-                println!("TENCENT ERR kind={:?} raw={:?}", err.kind(), err.raw_os_error());
+                println!("HTTP ERR kind={:?} raw={:?}", err.kind(), err.raw_os_error());
                 ui.set_metals_status("价格获取失败".into());
             }
         }

@@ -815,19 +815,24 @@ impl slint::platform::Platform for BluekernelBackend {
                 draw_result.map_err(|err| slint::PlatformError::Other(err.to_string()))?;
                 if redrawn {
                     frame_number += 1;
-                    println!(
-                        "[SLINT_STATS] mode=rgb565-bg/stack16 frame={} total_us={} io_us={} cpu_us={} lines={}/{} pixels={} writes={}/{} bytes={}",
-                        frame_number,
-                        total_us,
-                        frame_stats.io_us,
-                        total_us.saturating_sub(frame_stats.io_us),
-                        frame_stats.full_lines,
-                        frame_stats.partial_lines,
-                        frame_stats.pixels,
-                        frame_stats.full_writes,
-                        frame_stats.partial_writes,
-                        frame_stats.bytes,
-                    );
+                    // Once every 30 frames (~1 per interaction burst) is enough
+                    // to spot render-cost regressions without flooding the
+                    // serial console during swipes and animations.
+                    if frame_number % 30 == 1 {
+                        println!(
+                            "[SLINT_STATS] mode=rgb565-bg/stack16 frame={} total_us={} io_us={} cpu_us={} lines={}/{} pixels={} writes={}/{} bytes={}",
+                            frame_number,
+                            total_us,
+                            frame_stats.io_us,
+                            total_us.saturating_sub(frame_stats.io_us),
+                            frame_stats.full_lines,
+                            frame_stats.partial_lines,
+                            frame_stats.pixels,
+                            frame_stats.full_writes,
+                            frame_stats.partial_writes,
+                            frame_stats.bytes,
+                        );
+                    }
                 }
 
                 // After Slint finishes drawing its overlay (the image viewer frame),

@@ -192,11 +192,9 @@ export component SdCardPage inherits AppPage {
     // here. Map the y coordinate to a visible row and open that entry.
     // Rows start at y=124px with 56px spacing, x spans 16..464px.
     tap(mx, my) => {
-        root.debug("SD tap mx=" + mx + " my=" + my);
         if !root.viewer-open && root.total-count > 0 {
             if mx >= 16.0 && mx < 464.0 && my >= 124.0 && my < 124.0 + root.visible-count * 56.0 {
                 let index = (my - 124.0) / 56.0;
-                root.debug("SD tap -> entry " + index);
                 root.entry-selected(index);
             }
         }

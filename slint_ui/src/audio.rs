@@ -201,12 +201,9 @@ fn playback_tick(ui: &MainWindow) {
         // Lazily open /dev/i2s0 on first tick.
         if player.file.is_none() {
             match std::fs::OpenOptions::new().write(true).open("/dev/i2s0") {
-                Ok(f) => {
-                    println!("[AUDIO] /dev/i2s0 opened, starting playback");
-                    player.file = Some(f);
-                }
+                Ok(f) => player.file = Some(f),
                 Err(e) => {
-                    println!("[AUDIO] Cannot open /dev/i2s0: {}", e);
+                    println!("[AUDIO] /dev/i2s0 open failed: {e}");
                     set_status(ui, &player.source, format!("打开 I2S 失败: {}", e));
                     set_playing(ui, &player.source, false);
                     return;
@@ -220,7 +217,7 @@ fn playback_tick(ui: &MainWindow) {
         if raw_len == 0 {
             // Playback complete — close /dev/i2s0 so the kernel drains the
             // TX ring and stops the DMA engine (File drop → close → drain_and_stop).
-            println!("[AUDIO] Playback complete ({} bytes)", player.offset);
+            println!("[AUDIO] playback done ({} bytes)", player.offset);
             set_status(ui, &player.source, "播放完成".to_string());
             set_playing(ui, &player.source, false);
             drop(player.file.take());
@@ -229,13 +226,6 @@ fn playback_tick(ui: &MainWindow) {
         }
 
         let lj_len = (raw_len / 2) * 16;
-        let chunk_index = player.offset / RAW_CHUNK;
-        if chunk_index < 3 || chunk_index % 16 == 0 {
-            println!(
-                "[AUDIO] chunk={} pcm_offset={} raw_len={} i2s_len={}",
-                chunk_index, player.offset, raw_len, lj_len
-            );
-        }
         // Copy PCM slice first to avoid borrowing player.buf while pcm borrows player.
         let is_file_source = matches!(player.source, AudioSource::File { .. });
         let pcm_chunk: Vec<u8> = if !is_file_source {
@@ -278,10 +268,7 @@ fn playback_tick(ui: &MainWindow) {
                 }
             }
             Err(e) => {
-                println!(
-                    "[AUDIO] Write error: chunk={} pcm_offset={} raw_len={} i2s_len={} error={}",
-                    chunk_index, player.offset, raw_len, lj_len, e
-                );
+                println!("[AUDIO] write error at {}: {}", player.offset, e);
                 set_status(ui, &player.source, format!("播放错误: {}", e));
                 set_playing(ui, &player.source, false);
             }
@@ -430,7 +417,6 @@ impl AudioVolumeController {
             let t = (pct as u32 - 1) * (pct as u32 - 1);
             (78 + (139 * t / (99 * 99))) as u8
         };
-        println!("[AUDIO_VOL] set {} ({}%)", hw_value, pct);
         let Some(fd) = self.fd.as_ref() else {
             return;
         };
@@ -451,8 +437,6 @@ impl AudioVolumeController {
         let cmd: &[u8] = if mute { b"mute\n" } else { b"unmute\n" };
         if let Err(error) = fd.write_command(cmd) {
             println!("[AUDIO_VOL] mute={} failed: {error}", mute);
-        } else {
-            println!("[AUDIO_VOL] mute={}", mute);
         }
     }
 
@@ -473,7 +457,6 @@ impl AudioVolumeController {
                     let t = ((hw_value as u32 - 78) * 99 * 99 / 139) as f32;
                     (1 + t.sqrt() as u32).min(100) as u8
                 };
-                println!("[AUDIO_VOL] read {} ({}%)", hw_value, pct);
                 pct
             }
             Err(error) => {
@@ -535,7 +518,6 @@ pub(crate) fn install(ui: &MainWindow) -> slint::Timer {
         };
 
         if ui.get_audio_playing() {
-            println!("[AUDIO] Already playing, ignoring play request");
             return;
         }
 
@@ -570,7 +552,6 @@ pub(crate) fn install(ui: &MainWindow) -> slint::Timer {
             drop(player.file.take());
             drop(player.wav_file.take());
         });
-        println!("[AUDIO] Stopped");
     });
 
     // Install a 10ms timer that drives playback chunks while playing.
@@ -613,7 +594,7 @@ fn start_playback(ui: &MainWindow, label: &str) {
         let source = p.borrow().source.clone();
         set_playing(ui, &source, true);
     });
-    println!("[AUDIO] Play started: {}", label);
+    println!("[AUDIO] play: {}", label);
 
     UNMUTE_TIMER.with(|timer| {
         timer.start(
