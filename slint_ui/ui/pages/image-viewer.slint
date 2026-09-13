@@ -30,9 +30,11 @@ export component ImageViewer inherits Rectangle {
     }
 
     // Image area background. The PNG itself is drawn by direct framebuffer
-    // writes (png_view.rs) over the 60..424 px visible band, scaled to fit
-    // (contain) and centered with aspect preserved. This rectangle only paints
-    // the backdrop behind the title row before the PNG blit lands.
+    // writes (png_view.rs) starting at page y=102 (below this 40px title
+    // row), scaled to fit (contain) and centered with aspect preserved.
+    // This rectangle only paints the backdrop behind the title row before
+    // the PNG blit lands; PNG_PANEL_* in png_view.rs must stay aligned with
+    // this split.
     Rectangle {
         x: 0px; y: 40px; width: parent.width; height: parent.height - 40px;
         background: #05090c;
