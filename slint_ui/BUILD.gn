@@ -80,6 +80,7 @@ reload_autoconf_and_build("slint_ui_example") {
     "src/sched_mon.rs",
     "src/sdcard.rs",
     "src/imu.rs",
+    "src/keys.rs",
     "src/audio.rs",
     "src/audio_pcm_short.rs",
     "src/text_pages.rs",

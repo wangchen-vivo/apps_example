@@ -228,6 +228,9 @@ fn playback_tick(ui: &MainWindow) {
         let lj_len = (raw_len / 2) * 16;
         // Copy PCM slice first to avoid borrowing player.buf while pcm borrows player.
         let is_file_source = matches!(player.source, AudioSource::File { .. });
+        if player.offset == 0 {
+            println!("[AUDIO] tick source={} is_file={}", player.source.label(), is_file_source);
+        }
         let pcm_chunk: Vec<u8> = if !is_file_source {
             let pcm = EXAMPLE_PCM.as_slice();
             pcm[player.offset..player.offset + raw_len].to_vec()
@@ -377,6 +380,11 @@ struct AudioVolumeController {
     last_set: Cell<Option<u8>>,
 }
 
+/// Lowest audible codec value, equal to the previous curve's value at 60%.
+const AUDIO_VOLUME_MIN: u32 = 127;
+/// Highest codec value exposed by the UI; higher values clip the speaker PA.
+const AUDIO_VOLUME_MAX: u32 = 217;
+
 impl AudioVolumeController {
     fn new() -> IoResult<Self> {
         let fd = AudioVolumeFd::open()?;
@@ -400,31 +408,29 @@ impl AudioVolumeController {
     /// clips badly above that, so the top of the register range is kept
     /// out of the UI's 100%.
     ///
-    /// Measured on this board: register values below 78 (~-10 dB rel full
-    /// scale) are inaudible through the speaker. 0% is true mute (reg 0);
-    /// 1% lands directly at that audibility floor and 1-100% spreads
-    /// quadratically across the audible window so the low end is usable
-    /// instead of dying into the threshold.
+    /// 0% is true mute (reg 0). The previous curve's 60% value (reg 127)
+    /// becomes the new 1% floor, and 1-100% is linear across 127-217.
     fn set(&self, pct: u8) {
         let pct = pct.min(100);
         if self.last_set.get() == Some(pct) {
             return;
         }
-        // 0 = mute; 1..100 -> 78 + 139 * ((pct-1)/99)²
+        // 0 = mute; 1..100 -> 127..217, with rounded linear interpolation.
         let hw_value = if pct == 0 {
             0
         } else {
-            let t = (pct as u32 - 1) * (pct as u32 - 1);
-            (78 + (139 * t / (99 * 99))) as u8
+            let offset = (AUDIO_VOLUME_MAX - AUDIO_VOLUME_MIN) * (pct as u32 - 1);
+            (AUDIO_VOLUME_MIN + (offset + 49) / 99) as u8
         };
         let Some(fd) = self.fd.as_ref() else {
             return;
         };
         if let Err(error) = fd.write_volume(hw_value) {
-            println!("[AUDIO_VOL] set failed: {error}");
+            println!("[AUDIO] volume set failed: {error}");
             self.last_set.set(None);
         } else {
             self.last_set.set(Some(pct));
+            println!("[AUDIO] volume {pct}%");
         }
     }
 
@@ -436,7 +442,7 @@ impl AudioVolumeController {
         };
         let cmd: &[u8] = if mute { b"mute\n" } else { b"unmute\n" };
         if let Err(error) = fd.write_command(cmd) {
-            println!("[AUDIO_VOL] mute={} failed: {error}", mute);
+            println!("[AUDIO] mute={} failed: {error}", mute);
         }
     }
 
@@ -447,20 +453,20 @@ impl AudioVolumeController {
         };
         match fd.read_volume() {
             Ok(hw_value) => {
-                // Inverse of set()'s audible-window quadratic:
-                // reg 0 -> 0%, 1..78 -> 1%, 79..217 -> 1 + 99·√((reg-78)/139).
+                // Inverse of set()'s audible-window linear mapping.
                 let pct = if hw_value == 0 {
                     0
-                } else if hw_value <= 78 {
+                } else if hw_value as u32 <= AUDIO_VOLUME_MIN {
                     1
                 } else {
-                    let t = ((hw_value as u32 - 78) * 99 * 99 / 139) as f32;
-                    (1 + t.sqrt() as u32).min(100) as u8
+                    let offset = (hw_value as u32 - AUDIO_VOLUME_MIN) * 99;
+                    let range = AUDIO_VOLUME_MAX - AUDIO_VOLUME_MIN;
+                    (1 + (offset + range / 2) / range).min(100) as u8
                 };
                 pct
             }
             Err(error) => {
-                println!("[AUDIO_VOL] read failed: {error}");
+                println!("[AUDIO] volume read failed: {error}");
                 100
             }
         }
@@ -477,7 +483,7 @@ pub(crate) fn install(ui: &MainWindow) -> slint::Timer {
     let volume_controller = match AudioVolumeController::new() {
         Ok(c) => Rc::new(RefCell::new(c)),
         Err(error) => {
-            println!("[AUDIO_VOL] failed to open audio_volume device: {error}");
+            println!("[AUDIO] volume device open failed: {error}");
             // Use a sentinel empty controller so callbacks stay simple.
             Rc::new(RefCell::new(AudioVolumeController::disabled()))
         }
@@ -494,7 +500,13 @@ pub(crate) fn install(ui: &MainWindow) -> slint::Timer {
 
     let vol_active_weak = ui.as_weak();
     let active_controller = volume_controller.clone();
+    let page_active = std::rc::Rc::new(std::cell::Cell::new(false));
+    let active_state = page_active.clone();
     ui.on_audio_page_active_changed(move |active| {
+        if active_state.replace(active) == active {
+            return;
+        }
+        println!("[PAGE] {} audio", if active { "enter" } else { "exit" });
         if active {
             if let Some(ui) = vol_active_weak.upgrade() {
                 let value = active_controller.borrow().get();
@@ -521,7 +533,23 @@ pub(crate) fn install(ui: &MainWindow) -> slint::Timer {
             return;
         }
 
-        // The audio page always plays the built-in PCM.
+        // The audio page always plays the built-in PCM; the SD-card audio
+        // viewer re-arms whatever WAV the browser last opened (its path is
+        // kept in the File source) so the play button does not silently
+        // fall back to the built-in TTS.
+        if ui.get_sd_audio_open() {
+            let path = PLAYER.with(|p| match p.borrow().source.clone() {
+                AudioSource::File { path, .. } => Some(path),
+                _ => None,
+            });
+            if let Some(path) = path {
+                if let Err(error) = play_file(&ui, &path) {
+                    println!("[AUDIO] re-open failed: {error}");
+                }
+                return;
+            }
+        }
+
         PLAYER.with(|p| {
             let mut player = p.borrow_mut();
             *player = AudioPlayer::new();
@@ -536,6 +564,7 @@ pub(crate) fn install(ui: &MainWindow) -> slint::Timer {
             Some(ui) => ui,
             None => return,
         };
+        println!("[AUDIO] stop");
 
         // Clear the flag of whichever UI owns the current source.
         PLAYER.with(|p| {
@@ -554,7 +583,8 @@ pub(crate) fn install(ui: &MainWindow) -> slint::Timer {
         });
     });
 
-    // Install a 10ms timer that drives playback chunks while playing.
+    // Install a 10ms timer that drives playback chunks while playing, and
+    // polls board keys for volume control while an audio UI is on screen.
     let timer_ui = ui.as_weak();
     let timer = slint::Timer::default();
     timer.start(
@@ -566,7 +596,32 @@ pub(crate) fn install(ui: &MainWindow) -> slint::Timer {
                 None => return,
             };
 
-            if ui.get_audio_playing() {
+            // Volume keys (Key2/GPIO9 = down, Key3/GPIO10 = up) apply while the audio
+            // page or the SD-card audio viewer is on screen.
+            crate::keys::poll();
+            let on_audio_ui =
+                ui.get_current_app() == 15 || ui.get_sd_audio_open();
+            if on_audio_ui {
+                let step = if crate::keys::take_key2() {
+                    -10
+                } else if crate::keys::take_key3() {
+                    10
+                } else {
+                    0
+                };
+                if step != 0 {
+                    let pct = (ui.get_audio_volume() as i32 + step).clamp(0, 100) as u8;
+                    ui.set_audio_volume(pct as i32);
+                    VOLUME_CONTROLLER.with(|slot| {
+                        if let Some(controller) = slot.borrow().as_ref() {
+                            controller.borrow().set(pct);
+                        }
+                    });
+                    ui.set_audio_status(format!("音量 {}%", pct).into());
+                }
+            }
+
+            if ui.get_audio_playing() || ui.get_sd_audio_playing() {
                 playback_tick(&ui);
             }
         },
@@ -638,6 +693,7 @@ fn skip_wav_to_data(file: &mut std::fs::File) -> IoResult<()> {
 /// supported WAV (16-bit mono 16 kHz PCM). Status updates go to the SD
 /// card viewer (`sd-audio-*` properties), not the audio page.
 pub(crate) fn play_file(ui: &MainWindow, path: &str) -> IoResult<()> {
+    println!("[AUDIO] play_file path={path}");
     if PLAYER.with(|p| p.borrow().file.is_some()) {
         return Err(Error::new(ErrorKind::Other, "正在播放中"));
     }

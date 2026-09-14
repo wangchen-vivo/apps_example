@@ -28,6 +28,7 @@ mod battery;
 mod brightness;
 mod flash_io;
 mod imu;
+mod keys;
 mod math;
 mod metals;
 mod png_view;
@@ -712,6 +713,38 @@ pub(crate) fn uptime_micros() -> u128 {
     (ts.tv_sec as u128) * 1_000_000 + (ts.tv_nsec as u128) / 1_000
 }
 
+/// Print a one-line heap snapshot read from /proc/meminfo.
+pub(crate) fn log_mem_snapshot() {
+    use std::io::Read;
+    let Ok(mut file) = std::fs::File::open("/proc/meminfo") else {
+        println!("[MEM] /proc/meminfo unavailable");
+        return;
+    };
+    let mut buf = std::string::String::new();
+    if file.read_to_string(&mut buf).is_err() {
+        println!("[MEM] /proc/meminfo read failed");
+        return;
+    }
+    let (mut total, mut used, mut max_used, mut free, mut largest) =
+        (0u64, 0u64, 0u64, 0u64, 0u64);
+    for line in buf.lines() {
+        let Some((key, value)) = line.split_once(':') else { continue };
+        let v = value.split_whitespace().next().and_then(|s| s.parse::<u64>().ok());
+        match key.trim() {
+            "MemTotal" => total = v.unwrap_or(0),
+            "MemUsed" => used = v.unwrap_or(0),
+            "MemMaxUsed" => max_used = v.unwrap_or(0),
+            "MemAvailable" => free = v.unwrap_or(0),
+            "MemLargestFree" => largest = v.unwrap_or(0),
+            _ => {}
+        }
+    }
+    println!(
+        "[MEM] t={}s total={total} used={used} maxUsed={max_used} free={free} largest={largest} kB",
+        uptime_millis() / 1000
+    );
+}
+
 struct BluekernelBackend {
     window: RefCell<Option<Rc<slint::platform::software_renderer::MinimalSoftwareWindow>>>,
 }
@@ -752,9 +785,17 @@ impl slint::platform::Platform for BluekernelBackend {
         };
         let mut touch_error_reported = false;
         let mut frame_number = 0u64;
+        let mut last_mem_snap_ms = 0u128;
+        const MEM_SNAP_INTERVAL_MS: u128 = 2000;
 
         loop {
             slint::platform::update_timers_and_animations();
+
+            let now_ms = uptime_millis();
+            if now_ms.saturating_sub(last_mem_snap_ms) >= MEM_SNAP_INTERVAL_MS {
+                last_mem_snap_ms = now_ms;
+                log_mem_snapshot();
+            }
 
             if let Some(window) = self.window.borrow().clone() {
                 // Dispatch input before drawing so its visual state is visible
@@ -875,13 +916,36 @@ fn run_slint_ui() -> IoResult<()> {
     let _sched_mon_timer = sched_mon::install(&ui);
     let _flash_io_timer = flash_io::install(&ui);
     let _metals_timer = metals::install(&ui);
-    brightness::install(&ui);
+    let _brightness_timer = brightness::install(&ui);
     let _audio_timer = audio::install(&ui);
+
+    // Page enter/exit log for the pages without a Rust module (screencolor,
+    // touch, power) and for the launcher. Other pages log in their own module
+    // via the per-page active-changed callback. Slint's `changed` callback
+    // does not pass the previous value, so cache it here.
+    let last_app = std::cell::Cell::new(-1i32);
+    ui.on_app_changed(move |app| {
+        let prev = last_app.replace(app);
+        match prev {
+            9 => println!("[PAGE] exit screencolor"),
+            16 => println!("[PAGE] exit touch"),
+            17 => println!("[PAGE] exit power"),
+            _ => {}
+        }
+        match app {
+            9 => println!("[PAGE] enter screencolor"),
+            16 => println!("[PAGE] enter touch"),
+            17 => println!("[PAGE] enter power"),
+            -1 => println!("[PAGE] enter launcher"),
+            _ => {}
+        }
+    });
 
     // Power page: drive the PMU through /dev/battery text commands.
     // "reset" = CPU/peripheral reset (chip ROM routine, power stays on);
     // "poweroff" = PMU shutdown (board stays off until the PWR key).
     ui.on_reboot(|| {
+        println!("[POWER] reboot");
         // Darken the screen first: the AMOLED holds its last frame through
         // the reset (CPU reset does not drop the display rail).
         screen_dark();
@@ -890,6 +954,7 @@ fn run_slint_ui() -> IoResult<()> {
         }
     });
     ui.on_power_off(|| {
+        println!("[POWER] poweroff");
         // Darken the screen first: the AMOLED holds its last frame while
         // its rail stays powered through the PMU shutdown sequence.
         screen_dark();

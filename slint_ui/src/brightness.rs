@@ -143,12 +143,12 @@ fn syscall_error(ret: libc::c_int) -> Error {
 }
 
 /// Connect the brightness control to the shared launcher window.
-pub(crate) fn install(ui: &MainWindow) {
+pub(crate) fn install(ui: &MainWindow) -> slint::Timer {
     let controller = match BrightnessController::new() {
         Ok(controller) => Rc::new(RefCell::new(controller)),
         Err(error) => {
             println!("[BACKLIGHT] failed to open backlight device: {error}");
-            return;
+            return slint::Timer::default();
         }
     };
 
@@ -170,7 +170,13 @@ pub(crate) fn install(ui: &MainWindow) {
 
     let ui_weak = ui.as_weak();
     let active_controller = controller.clone();
+    let page_active = std::rc::Rc::new(std::cell::Cell::new(false));
+    let active_state = page_active.clone();
     ui.on_brightness_page_active_changed(move |active| {
+        if active_state.replace(active) == active {
+            return;
+        }
+        println!("[PAGE] {} brightness", if active { "enter" } else { "exit" });
         if active {
             if let Some(ui) = ui_weak.upgrade() {
                 let value = active_controller.borrow().get();
@@ -179,4 +185,38 @@ pub(crate) fn install(ui: &MainWindow) {
             }
         }
     });
+
+    let timer_ui = ui.as_weak();
+    let key_controller = controller.clone();
+    let timer = slint::Timer::default();
+    timer.start(
+        slint::TimerMode::Repeated,
+        std::time::Duration::from_millis(30),
+        move || {
+            if !page_active.get() {
+                return;
+            }
+            let Some(ui) = timer_ui.upgrade() else {
+                return;
+            };
+
+            crate::keys::poll();
+            let step = if crate::keys::take_key2() {
+                -10
+            } else if crate::keys::take_key3() {
+                10
+            } else {
+                0
+            };
+            if step == 0 {
+                return;
+            }
+
+            let pct = (ui.get_brightness() + step).clamp(30, 100) as u8;
+            ui.set_brightness(pct as i32);
+            key_controller.borrow().set(pct);
+            key_controller.borrow().commit(pct);
+        },
+    );
+    timer
 }
