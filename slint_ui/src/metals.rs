@@ -134,7 +134,7 @@ fn config_str(value: &[u8]) -> &str {
 impl TcpSocket {
     fn connect(ip: [u8; 4], port: u16) -> IoResult<Self> {
         println!(
-            "HTTP CONNECT {}.{}.{}.{}:{}",
+            "[HTTP:metals] connect {}.{}.{}.{}:{}",
             ip[0], ip[1], ip[2], ip[3], port
         );
         let fd = librs::net::socket::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
@@ -177,11 +177,11 @@ impl TcpSocket {
             )
         };
         if let Err(librs::errno::Errno(errno)) = ret {
-            println!("HTTP CONNECT ERR errno={}", errno);
+            println!("[HTTP:metals] connect err errno={}", errno);
             let _ = librs::syscall::sys::Sys::close(fd);
             return Err(Error::from_raw_os_error(errno));
         }
-        println!("HTTP CONNECT OK port={}", port);
+        println!("[HTTP:metals] connect ok port={}", port);
         Ok(Self { fd })
     }
     fn write_all(&mut self, mut buf: &[u8]) -> IoResult<()> {
@@ -513,7 +513,7 @@ impl MetalsFetcher {
                 match open_ctl_socket() {
                     Ok(fd) => self.ctl_socket = Some(fd),
                     Err(_) => {
-                        println!("WIFI SOCK ERR");
+                        println!("[WIFI:metals] socket err");
                         self.wifi_state = WifiState::Failed;
                         ui.set_metals_status("WiFi 套接字失败".into());
                         return false;
@@ -521,15 +521,15 @@ impl MetalsFetcher {
                 }
                 let fd = self.ctl_socket.unwrap();
                 if let Err(_) = set_passphrase(fd, config_str(blueos_kconfig::CONFIG_WLAN_PASSWORD)) {
-                    println!("WIFI PSK ERR");
+                    println!("[WIFI:metals] psk err");
                 }
                 match trigger_connect(fd, config_str(blueos_kconfig::CONFIG_WLAN_SSID)) {
                     Ok(()) => {
-                        println!("WIFI CONNECTING");
+                        println!("[WIFI:metals] connecting");
                         self.wifi_state = WifiState::Connecting { started_at: now };
                     }
                     Err(_) => {
-                        println!("WIFI CONN ERR");
+                        println!("[WIFI:metals] connect err");
                         self.wifi_state = WifiState::Failed;
                         ui.set_metals_status("WiFi 连接失败".into());
                     }
@@ -541,7 +541,7 @@ impl MetalsFetcher {
                 // to userspace, so we can't poll for a real link-up event.
                 // Wait briefly for station association after the connect ioctl.
                 if now.saturating_sub(started_at) >= WIFI_CONNECT_GRACE_MS {
-                    println!("WIFI UP");
+                    println!("[WIFI:metals] up");
                     self.wifi_state = WifiState::Connected;
                     ui.set_metals_status("WiFi 已连接".into());
                     true
@@ -563,7 +563,7 @@ impl MetalsFetcher {
             .spawn(move || {
                 match http_get(HTTP_PROXY_IP, HTTP_PROXY_PORT, HTTP_PATH, HTTP_HOST) {
                     Ok((200, head, body)) => {
-                        println!("HTTP RESPONSE 200");
+                        println!("[HTTP:metals] response 200");
                         RESULT_HTTP_CODE.store(200, Ordering::Relaxed);
                         if let Some(ts) = parse_date_header(&head) {
                             RESULT_SERVER_TS.store(ts, Ordering::Relaxed);
@@ -581,12 +581,12 @@ impl MetalsFetcher {
                         RESULT_OK.store(true, Ordering::Relaxed);
                     }
                     Ok((code, _, _)) => {
-                        println!("HTTP RESPONSE {}", code);
+                        println!("[HTTP:metals] response {}", code);
                         RESULT_HTTP_CODE.store(code as i32, Ordering::Relaxed);
                         RESULT_OK.store(false, Ordering::Relaxed);
                     }
                     Err(err) => {
-                        println!("HTTP ERR kind={:?} raw={:?}", err.kind(), err.raw_os_error());
+                        println!("[HTTP:metals] err kind={:?} raw={:?}", err.kind(), err.raw_os_error());
                         RESULT_HTTP_CODE.store(0, Ordering::Relaxed);
                         RESULT_OK.store(false, Ordering::Relaxed);
                     }
@@ -686,7 +686,7 @@ impl MetalsFetcher {
                 self.refreshing = true;
                 ui.set_metals_refreshing(true);
             }
-            println!("REFRESH");
+            println!("[METALS] fetch start");
             FETCH_GENERATION.fetch_add(1, Ordering::Relaxed);
             FETCH_STARTED_MS.store(now as u64, Ordering::Relaxed);
             FETCH_PENDING.store(true, Ordering::Relaxed);
@@ -715,6 +715,7 @@ pub(crate) fn install(ui: &MainWindow) -> slint::Timer {
     let cb_fetcher = fetcher.clone();
     let cb_ui = ui.as_weak();
     ui.on_metals_refresh(move || {
+        println!("[METALS] refresh");
         if let Some(ui) = cb_ui.upgrade() {
             cb_fetcher.borrow_mut().request_refresh(&ui);
         }
@@ -722,7 +723,13 @@ pub(crate) fn install(ui: &MainWindow) -> slint::Timer {
 
     let active_fetcher = fetcher.clone();
     let active_ui = ui.as_weak();
+    let page_active = std::rc::Rc::new(std::cell::Cell::new(false));
+    let active_state = page_active.clone();
     ui.on_metals_active_changed(move |active| {
+        if active_state.replace(active) == active {
+            return;
+        }
+        println!("[PAGE] {} metals", if active { "enter" } else { "exit" });
         if let Some(ui) = active_ui.upgrade() {
             active_fetcher.borrow_mut().set_active(&ui, active);
         }

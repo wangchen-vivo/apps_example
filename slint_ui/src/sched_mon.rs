@@ -13,8 +13,10 @@
 // limitations under the License.
 
 // Scheduler and resource monitor backend.
-// Polls /proc/stat, /proc/meminfo, and /proc/0/task/<tid>/status on the UI thread
-// via a repeating slint::Timer, following the imu.rs pattern.
+// Polls /proc/stat, /proc/meminfo, and /proc/0/task/<tid>/status on a
+// dedicated worker thread so the Slint UI thread never blocks on procfs
+// reads. The worker publishes parsed results into shared atomics and a
+// mutex-guarded task snapshot; the UI timer copies them into Slint models.
 
 use crate::app_window::MainWindow;
 use crate::syscall_error;
@@ -24,10 +26,14 @@ use slint::{ComponentHandle, Model};
 use std::cell::RefCell;
 use std::io::{Error, ErrorKind, Result as IoResult};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Mutex;
 
-const POLL_MS: u64 = 500; // 2 Hz refresh rate
+const POLL_MS: u64 = 500; // 2 Hz CPU/mem refresh rate
+const TASK_POLL_MS: u64 = 2000; // task list refresh rate (5x less churn)
 const CORE_COUNT: usize = 1; // ESP32-C6 is single-core RISC-V
 const MAX_TASK_LINES: usize = 8;
+const WORKER_STACK_SIZE: usize = 8 * 1024;
 
 /// Snapshot of CPU idle/system ticks for computing delta usage.
 #[derive(Clone, Copy, Default)]
@@ -166,13 +172,17 @@ fn parse_thread_status(content: &[u8], tid: usize) -> (String, String, String, S
         }
     }
 
-    // State full names for display.
+    // State abbreviated to keep the per-frame glyph count low. The software
+    // renderer grows its glyph texture array from 256 to 512 entries the
+    // moment a frame exceeds 256 glyphs, and that 14336-byte allocation is
+    // the OOM point on this page. Short state/name strings keep 8 rows of
+    // 5 columns comfortably below 256 glyphs.
     let state_abbr = match state {
-        "running" => "RUNNING",
-        "ready" => "READY",
-        "suspended" => "SUSPENDED",
+        "running" => "RUN",
+        "ready" => "RDY",
+        "suspended" => "SUSP",
         "idle" => "IDLE",
-        "retired" => "RETIRED",
+        "retired" => "RET",
         _ => "?",
     };
 
@@ -185,8 +195,10 @@ fn parse_thread_status(content: &[u8], tid: usize) -> (String, String, String, S
         _ => "norm",
     };
 
-    // Name column shows the custom name verbatim (empty falls back to kind).
-    let typed_name = if name.is_empty() { kind } else { name };
+    // Name column shows the custom name verbatim (empty falls back to kind),
+    // truncated so the longest row still stays under the glyph budget.
+    let name_src = if name.is_empty() { kind } else { name };
+    let typed_name: String = name_src.chars().take(10).collect();
 
     // TID: show last 4 hex digits
     let tid_str = format!("{:04X}", tid & 0xFFFF);
@@ -197,7 +209,7 @@ fn parse_thread_status(content: &[u8], tid: usize) -> (String, String, String, S
         type_abbr.to_string(),
         state_abbr.to_string(),
         prio_str,
-        typed_name.to_string(),
+        typed_name,
     )
 }
 
@@ -324,6 +336,7 @@ fn list_task_entries() -> IoResult<Vec<usize>> {
     Ok(tids)
 }
 
+#[derive(Clone)]
 struct TaskEntry {
     tid_disp: String,
     type_abbr: String,
@@ -332,233 +345,352 @@ struct TaskEntry {
     typed_name: String,
 }
 
+// ---------------------------------------------------------------------------
+// Shared worker output. The worker thread writes these; the UI timer reads.
+// All values are plain data so the worker never touches Slint/MainWindow.
+// ---------------------------------------------------------------------------
+
+/// CPU usage percent for the single core, computed by the worker.
+static CPU_PCT: AtomicU32 = AtomicU32::new(0);
+/// Memory figures in kB (total / used / max-used), published by the worker.
+static MEM_TOTAL_KB: AtomicI32 = AtomicI32::new(0);
+static MEM_USED_KB: AtomicI32 = AtomicI32::new(0);
+static MEM_MAX_USED_KB: AtomicI32 = AtomicI32::new(0);
+/// Static CPU model/ISA and current clock text, published by the worker.
+static CPU_MODEL: Mutex<String> = Mutex::new(String::new());
+static CPU_ISA: Mutex<String> = Mutex::new(String::new());
+static CPU_MHZ: Mutex<String> = Mutex::new(String::new());
+/// Publish flags — set once when the worker has valid data.
+static CPUINFO_READY: AtomicBool = AtomicBool::new(false);
+/// Full task list, sorted by state (running/ready/other), published by the
+/// worker. The UI thread locks it briefly to slice the visible window.
+static TASK_ENTRIES: Mutex<Vec<TaskEntry>> = Mutex::new(Vec::new());
+static TASK_TOTAL: AtomicUsize = AtomicUsize::new(0);
+/// Worker state for CPU delta calculation.
+static PREV_TICKS: Mutex<Vec<CpuTickSnapshot>> = Mutex::new(Vec::new());
+static FIRST_STAT: AtomicBool = AtomicBool::new(true);
+/// Set true while the worker thread should keep running. The worker is
+/// spawned when the sched-mon page is entered and stopped when it is left,
+/// so the 16 KiB thread stack is only held while the page is on screen.
+static WORKER_RUNNING: AtomicBool = AtomicBool::new(false);
+static WORKER_SPAWNED: AtomicBool = AtomicBool::new(false);
+
+/// Start the background collector (called when the page is entered). The
+/// thread is spawned once for the whole process and parked on the gate
+/// between visits; subsequent entries just re-open the gate.
+fn start_worker() {
+    if WORKER_RUNNING.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    if !WORKER_SPAWNED.swap(true, Ordering::Relaxed) {
+        match std::thread::Builder::new()
+            .stack_size(WORKER_STACK_SIZE)
+            .spawn(worker_loop)
+        {
+            Ok(_) => {}
+            Err(error) => {
+                WORKER_SPAWNED.store(false, Ordering::Relaxed);
+                WORKER_RUNNING.store(false, Ordering::Relaxed);
+                println!("[SCHED_MON] worker spawn failed: {error}");
+            }
+        }
+    }
+}
+
+/// Stop the worker (page left): close the gate and let the thread park.
+/// The thread and its stack stay alive and resume on the next visit, so no
+/// per-visit spawn/teardown heap churn accumulates. Shared buffers keep
+/// their capacity and are overwritten on the next entry.
+fn stop_worker() {
+    if !WORKER_RUNNING.swap(false, Ordering::Relaxed) {
+        return;
+    }
+    TASK_TOTAL.store(0, Ordering::Relaxed);
+    CPU_PCT.store(0, Ordering::Relaxed);
+    MEM_TOTAL_KB.store(0, Ordering::Relaxed);
+    MEM_USED_KB.store(0, Ordering::Relaxed);
+    MEM_MAX_USED_KB.store(0, Ordering::Relaxed);
+    CPUINFO_READY.store(false, Ordering::Relaxed);
+}
+
+/// One full worker pass: read + parse every proc file, publish results.
+fn worker_pass() {
+    // ---- CPU usage ----
+    if let Ok(stat_content) = read_proc_file(b"/proc/stat\0") {
+        let current_ticks = parse_proc_stat(&stat_content);
+        let mut prev = match PREV_TICKS.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let first = FIRST_STAT.swap(false, Ordering::Relaxed);
+        if !first && current_ticks.len() == prev.len() {
+            let d_total = current_ticks[0].system.saturating_sub(prev[0].system);
+            let d_idle = current_ticks[0].idle.saturating_sub(prev[0].idle);
+            let pct = if d_total > 0 {
+                ((d_total - d_idle) as f32 / d_total as f32 * 100.0).min(100.0)
+            } else {
+                0.0
+            };
+            CPU_PCT.store(pct as u32, Ordering::Relaxed);
+        }
+        *prev = current_ticks;
+    }
+
+    // ---- Memory usage ----
+    if let Ok(mem_content) = read_proc_file(b"/proc/meminfo\0") {
+        let (total, used, max_used) = parse_proc_meminfo(&mem_content);
+        MEM_TOTAL_KB.store(total as i32, Ordering::Relaxed);
+        MEM_USED_KB.store(used as i32, Ordering::Relaxed);
+        MEM_MAX_USED_KB.store(max_used as i32, Ordering::Relaxed);
+    }
+
+    // ---- CPU info (static-ish; only the MHz line changes) ----
+    if !CPUINFO_READY.load(Ordering::Relaxed) {
+        if let Ok(c) = read_proc_file(b"/proc/cpuinfo\0") {
+            let (uarch, isa, mhz_text) = parse_cpuinfo(&c);
+            if let Ok(mut m) = CPU_MODEL.lock() {
+                *m = uarch;
+            }
+            if let Ok(mut m) = CPU_ISA.lock() {
+                *m = isa;
+            }
+            if let Ok(mut m) = CPU_MHZ.lock() {
+                *m = mhz_text;
+            }
+            CPUINFO_READY.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Collect + publish the task list snapshot. Kept separate from the CPU/mem
+/// pass so it can run on a slower cadence and reduce heap churn.
+fn worker_collect_tasks() {
+    let tids = match list_task_entries() {
+        Ok(tids) => tids,
+        Err(_) => return,
+    };
+    // Build directly into the shared buffer (clear + push) so the ≈14 KiB
+    // snapshot is never duplicated as a local Vec while the shared one is
+    // alive. The UI thread slices rows under the same lock, so holding it
+    // across the reads is safe and blocks only a shallow window copy.
+    let mut entries = match TASK_ENTRIES.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    entries.clear();
+    for &tid in tids.iter() {
+        let path = path_for_task_status(tid);
+        let (tid_str, type_abbr, state_abbr, prio_str, typed_name) =
+            if let Ok(content) = read_proc_file(&path) {
+                parse_thread_status(&content, tid)
+            } else {
+                (
+                    format!("{:04X}", tid & 0xFFFF),
+                    "?".into(),
+                    "?".into(),
+                    "?".into(),
+                    "?".into(),
+                )
+            };
+        entries.push(TaskEntry {
+            tid_disp: tid_str,
+            type_abbr,
+            state_abbr,
+            prio_str,
+            typed_name,
+        });
+    }
+
+    // Sort: running first, then ready, then others; stable to preserve TID order for ties.
+    entries.sort_by_key(|e| match e.state_abbr.as_str() {
+        "RUN" => 0,
+        "RDY" => 1,
+        _ => 2,
+    });
+
+    // The shared buffer is already filled and sorted; just update the count.
+    drop(entries);
+    TASK_TOTAL.store(tids.len(), Ordering::Relaxed);
+}
+
+/// Worker entry: thread lives for the whole process lifetime and parks on
+/// the WORKER_RUNNING gate between page visits, so no per-visit spawn/drop
+/// heap churn accumulates. The inner loop runs one full pass and sleeps; on
+/// page leave the gate drops and the thread parks until the next visit.
+fn worker_loop() {
+    loop {
+        while !WORKER_RUNNING.load(Ordering::Relaxed) {
+            librs::time::msleep(POLL_MS as libc::c_uint);
+        }
+        FIRST_STAT.store(true, Ordering::Relaxed);
+        PREV_TICKS.lock().map(|mut g| g.clear());
+        let mut passes_since_tasks = u32::MAX; // collect on the first pass
+        while WORKER_RUNNING.load(Ordering::Relaxed) {
+            worker_pass();
+            if passes_since_tasks >= (TASK_POLL_MS / POLL_MS) as u32 {
+                worker_collect_tasks();
+                passes_since_tasks = 0;
+            } else {
+                passes_since_tasks += 1;
+            }
+            librs::time::msleep(POLL_MS as libc::c_uint);
+        }
+    }
+}
+
+/// UI-side scroll state. The worker owns all data; this only tracks the
+/// window offset and copies the latest snapshot into the Slint models.
 struct SchedMonitor {
-    prev_ticks: Vec<CpuTickSnapshot>,
-    first_stat: bool,
-    first_cpuinfo: bool,
-    scroll_offset: usize,
+    /// 0-based page index. Offset for slicing = page_index * MAX_TASK_LINES,
+    /// so pages are always aligned: 9 tasks → page 0 shows 1-8, page 1 shows
+    /// only the 9th.
+    page_index: usize,
     total_tasks: usize,
 }
 
 impl SchedMonitor {
     fn new() -> Self {
         Self {
-            prev_ticks: vec![CpuTickSnapshot::default(); CORE_COUNT],
-            first_stat: true,
-            first_cpuinfo: true,
-            scroll_offset: 0,
+            page_index: 0,
             total_tasks: 0,
         }
     }
 
-    /// Max valid scroll offset so the last window still fills all rows when
-    /// there are enough tasks; when fewer than MAX_TASK_LINES, offset is 0.
-    fn max_offset(&self) -> usize {
-        self.total_tasks.saturating_sub(MAX_TASK_LINES)
+    /// 1-based page number shown to the user.
+    fn page(&self) -> usize {
+        self.page_index + 1
+    }
+
+    /// Total page count for the current task total.
+    fn page_count(&self) -> usize {
+        (self.total_tasks + MAX_TASK_LINES - 1) / MAX_TASK_LINES
     }
 
     fn scroll_down(&mut self) {
-        // swipe-down → look at tasks above (offset toward 0)
-        self.scroll_offset = self.scroll_offset.saturating_sub(1);
+        // swipe-down → previous page
+        self.page_index = self.page_index.saturating_sub(1);
     }
 
     fn scroll_up(&mut self) {
-        // swipe-up → look at tasks below (offset toward max)
-        if self.scroll_offset < self.max_offset() {
-            self.scroll_offset += 1;
+        // swipe-up → next page, clamped to the last page.
+        if self.page_index + 1 < self.page_count() {
+            self.page_index += 1;
         }
     }
 
-    fn refresh_task_list(&mut self, ui: &MainWindow) {
-        // List ALL thread TIDs
-        let tids = match list_task_entries() {
-            Ok(tids) => tids,
-            Err(e) => {
-                return;
-            }
+    /// Copy the latest worker-published task snapshot window into the Slint
+    /// models, in place. Only changed rows dirty the scene. Each of the 5
+    /// columns is formatted as an 8-line string so the page uses 5 Text scene
+    /// items total instead of 40 cells.
+    fn copy_task_window(&mut self, ui: &MainWindow) {
+        self.total_tasks = TASK_TOTAL.load(Ordering::Relaxed);
+
+        let snapshot = match TASK_ENTRIES.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
         };
+        let offset = self.page_index * MAX_TASK_LINES;
 
-        // Collect status for all threads. Start with zero capacity so the Vec
-        // grows incrementally; pre-allocating capacity = tids.len() (≈120
-        // threads) reserved ~14 KiB in one shot and tipped the 272 KiB system
-        // heap into OOM on this page.
-        let mut entries: Vec<TaskEntry> = Vec::new();
+        let mut tid_col = String::new();
+        let mut type_col = String::new();
+        let mut state_col = String::new();
+        let mut prio_col = String::new();
+        let mut name_col = String::new();
+        let mut row = 0;
+        for entry in snapshot.iter().skip(offset).take(MAX_TASK_LINES) {
+            if row > 0 {
+                tid_col.push('\n');
+                type_col.push('\n');
+                state_col.push('\n');
+                prio_col.push('\n');
+                name_col.push('\n');
+            }
+            tid_col.push_str(&entry.tid_disp);
+            type_col.push_str(&entry.type_abbr);
+            state_col.push_str(&entry.state_abbr);
+            prio_col.push_str(&entry.prio_str);
+            name_col.push_str(&entry.typed_name);
+            row += 1;
+        }
+        drop(snapshot);
 
-        for &tid in tids.iter() {
-            let path = path_for_task_status(tid);
-            let (tid_str, type_abbr, state_abbr, prio_str, typed_name) =
-                if let Ok(content) = read_proc_file(&path) {
-                    parse_thread_status(&content, tid)
-                } else {
-                    (
-                        format!("{:04X}", tid & 0xFFFF),
-                        "?".into(),
-                        "?".into(),
-                        "?".into(),
-                        "?".into(),
-                    )
-                };
-
-            entries.push(TaskEntry {
-                tid_disp: tid_str,
-                type_abbr,
-                state_abbr,
-                prio_str,
-                typed_name,
-            });
+        while row < MAX_TASK_LINES {
+            tid_col.push('\n');
+            type_col.push('\n');
+            state_col.push('\n');
+            prio_col.push('\n');
+            name_col.push('\n');
+            row += 1;
         }
 
-        // Sort: running first, then ready, then others; stable to preserve TID order for ties.
-        entries.sort_by_key(|e| match e.state_abbr.as_str() {
-            "RUNNING" => 0,
-            "READY" => 1,
-            _ => 2,
-        });
-
-        // Take top MAX_TASK_LINES (no dedup — threads with custom names are
-        // all distinct anyway, and same-type threads are still worth showing).
-        let mut tid_col: Vec<slint::SharedString> = Vec::with_capacity(MAX_TASK_LINES);
-        let mut type_col: Vec<slint::SharedString> = Vec::with_capacity(MAX_TASK_LINES);
-        let mut state_col: Vec<slint::SharedString> = Vec::with_capacity(MAX_TASK_LINES);
-        let mut prio_col: Vec<slint::SharedString> = Vec::with_capacity(MAX_TASK_LINES);
-        let mut name_col: Vec<slint::SharedString> = Vec::with_capacity(MAX_TASK_LINES);
-
-        for entry in entries.iter().skip(self.scroll_offset).take(MAX_TASK_LINES) {
-            tid_col.push(entry.tid_disp.clone().into());
-            type_col.push(entry.type_abbr.clone().into());
-            state_col.push(entry.state_abbr.clone().into());
-            prio_col.push(entry.prio_str.clone().into());
-            name_col.push(entry.typed_name.clone().into());
-        }
-
-        // Fill remaining rows if fewer than MAX_TASK_LINES
-        while tid_col.len() < MAX_TASK_LINES {
-            tid_col.push("".into());
-            type_col.push("".into());
-            state_col.push("".into());
-            prio_col.push("".into());
-            name_col.push("".into());
-        }
-
-        // Update rows in-place via existing VecModels. Only changed rows
-        // dirty the scene; replacing the whole model every tick forced all
-        // 4×5 Text cells to recompute (248 dirty lines, 330ms per frame).
-        {
-            update_task_model(&ui.get_task_tids(), &tid_col);
-            update_task_model(&ui.get_task_types(), &type_col);
-            update_task_model(&ui.get_task_states(), &state_col);
-            update_task_model(&ui.get_task_prios(), &prio_col);
-            update_task_model(&ui.get_task_names(), &name_col);
-            ui.set_task_hidden(
-                tids.len()
-                    .saturating_sub(self.scroll_offset + MAX_TASK_LINES) as i32,
-            );
-            ui.set_task_total(tids.len() as i32);
-            self.total_tasks = tids.len();
-        }
+        ui.set_task_col_tid(tid_col.into());
+        ui.set_task_col_type(type_col.into());
+        ui.set_task_col_state(state_col.into());
+        ui.set_task_col_prio(prio_col.into());
+        ui.set_task_col_name(name_col.into());
+        ui.set_task_hidden(
+            self.total_tasks
+                .saturating_sub(self.page_index * MAX_TASK_LINES + MAX_TASK_LINES) as i32,
+        );
+        ui.set_task_total(self.total_tasks as i32);
+        ui.set_task_page(self.page() as i32);
+        ui.set_task_page_count(self.page_count() as i32);
     }
 
+    /// UI-side tick: copy the worker's latest data into Slint models.
+    /// Does zero /proc I/O — the worker thread owns all reads.
     fn tick(&mut self, ui: &MainWindow) {
-        // Only poll when the sched-mon page (app 6) is active
+        // Only touch the models when the sched-mon page (app 6) is active.
         if ui.get_current_app() != 6 {
             return;
         }
 
         // ---- Task list ----
-        self.refresh_task_list(ui);
+        self.copy_task_window(ui);
 
         // ---- CPU usage ----
-        if let Ok(stat_content) = read_proc_file(b"/proc/stat\0") {
-            let current_ticks = parse_proc_stat(&stat_content);
-            if !self.first_stat && current_ticks.len() == self.prev_ticks.len() {
-                // Calculate deltas
-                let mut cpu_pcts: Vec<f32> = Vec::with_capacity(CORE_COUNT);
-                for i in 0..current_ticks.len() {
-                    let d_total = current_ticks[i]
-                        .system
-                        .saturating_sub(self.prev_ticks[i].system);
-                    let d_idle = current_ticks[i]
-                        .idle
-                        .saturating_sub(self.prev_ticks[i].idle);
-                    if d_total > 0 {
-                        let pct = (d_total - d_idle) as f32 / d_total as f32 * 100.0;
-                        cpu_pcts.push(pct.min(100.0));
-                    } else {
-                        cpu_pcts.push(0.0);
-                    }
-                }
-                // Pad to CORE_COUNT
-                while cpu_pcts.len() < CORE_COUNT {
-                    cpu_pcts.push(0.0);
-                }
-                // Only push a new model when the rounded percentage changed;
-                // an identical value still dirties the CPU bar every tick.
-                let new_pct = cpu_pcts[0];
-                let old_pct = ui.get_cpu_usage_percent().row_data(0).unwrap_or(0.0);
-                if (new_pct - old_pct).abs() > 0.5 {
-                    let model = slint::ModelRc::new(slint::VecModel::from(cpu_pcts));
-                    ui.set_cpu_usage_percent(model);
-                }
-                ui.set_cpu_cores(CORE_COUNT as i32);
-            }
-            self.prev_ticks = current_ticks;
-            self.first_stat = false;
+        let pct = CPU_PCT.load(Ordering::Relaxed) as f32;
+        let old_pct = ui.get_cpu_usage_percent().row_data(0).unwrap_or(0.0);
+        if (pct - old_pct).abs() > 0.5 {
+            let model = slint::ModelRc::new(slint::VecModel::from(vec![pct]));
+            ui.set_cpu_usage_percent(model);
         }
+        ui.set_cpu_cores(CORE_COUNT as i32);
 
         // ---- Memory usage ----
-        if let Ok(mem_content) = read_proc_file(b"/proc/meminfo\0") {
-            let (total, used, max_used) = parse_proc_meminfo(&mem_content);
-            // Only update when the value changes (to avoid unnecessary redraws)
-            let eps = 0.5;
-            if (total - ui.get_mem_total_kb()).abs() > eps {
-                ui.set_mem_total_kb(total);
-            }
-            if (used - ui.get_mem_used_kb()).abs() > eps {
-                ui.set_mem_used_kb(used);
-            }
-            if (max_used - ui.get_mem_max_used_kb()).abs() > eps {
-                ui.set_mem_max_used_kb(max_used);
-            }
+        let total = MEM_TOTAL_KB.load(Ordering::Relaxed) as f32;
+        let used = MEM_USED_KB.load(Ordering::Relaxed) as f32;
+        let max_used = MEM_MAX_USED_KB.load(Ordering::Relaxed) as f32;
+        let eps = 0.5;
+        if (total - ui.get_mem_total_kb()).abs() > eps {
+            ui.set_mem_total_kb(total);
+        }
+        if (used - ui.get_mem_used_kb()).abs() > eps {
+            ui.set_mem_used_kb(used);
+        }
+        if (max_used - ui.get_mem_max_used_kb()).abs() > eps {
+            ui.set_mem_max_used_kb(max_used);
         }
 
-        // ---- CPU info ----
-        // Model and ISA are static; the clock frequency comes from the current
-        // hardware clock-tree configuration and may change at runtime.
-        if let Ok(c) = read_proc_file(b"/proc/cpuinfo\0") {
-            let (uarch, isa, mhz_text) = parse_cpuinfo(&c);
-            if self.first_cpuinfo {
-                ui.set_cpu_model(uarch.into());
-                ui.set_cpu_isa(isa.into());
-                self.first_cpuinfo = false;
+        // ---- CPU info (published once by the worker) ----
+        if CPUINFO_READY.load(Ordering::Relaxed) {
+            if let Ok(m) = CPU_MODEL.lock() {
+                let cur: slint::SharedString = ui.get_cpu_model();
+                if cur.as_str() != m.as_str() {
+                    ui.set_cpu_model(m.as_str().into());
+                }
             }
-            let cur: slint::SharedString = ui.get_cpu_mhz_text();
-            if cur.as_str() != mhz_text {
-                ui.set_cpu_mhz_text(mhz_text.into());
+            if let Ok(m) = CPU_ISA.lock() {
+                let cur: slint::SharedString = ui.get_cpu_isa();
+                if cur.as_str() != m.as_str() {
+                    ui.set_cpu_isa(m.as_str().into());
+                }
             }
-        }
-    }
-}
-
-/// Update a shared task-list column model in place, only touching rows whose
-/// value actually changed. Replacing the whole model every tick dirtied all
-/// 4×5 Text cells and forced a 330ms partial redraw even when the task list
-/// was identical to the previous tick. The caller must seed each column with
-/// an empty VecModel at install time so the downcast always succeeds.
-fn update_task_model(
-    existing: &slint::ModelRc<slint::SharedString>,
-    rows: &[slint::SharedString],
-) {
-    if let Some(model) = existing.as_any().downcast_ref::<slint::VecModel<slint::SharedString>>()
-    {
-        while model.row_count() < rows.len() {
-            model.push(rows[model.row_count()].clone());
-        }
-        while model.row_count() > rows.len() {
-            model.remove(model.row_count() - 1);
-        }
-        for (i, row) in rows.iter().enumerate() {
-            if model.row_data(i).as_ref() != Some(row) {
-                model.set_row_data(i, row.clone());
+            if let Ok(m) = CPU_MHZ.lock() {
+                let cur: slint::SharedString = ui.get_cpu_mhz_text();
+                if cur.as_str() != m.as_str() {
+                    ui.set_cpu_mhz_text(m.as_str().into());
+                }
             }
         }
     }
@@ -569,40 +701,35 @@ fn update_task_model(
 pub(crate) fn install(ui: &MainWindow) -> slint::Timer {
     let monitor = Rc::new(RefCell::new(SchedMonitor::new()));
 
-    // Seed empty VecModels so refresh_task_list can update rows in place
-    // (see update_task_model) instead of replacing the whole model each tick.
-    // Each column needs its own VecModel instance — ModelRc::clone() shares
-    // the underlying Rc, so all columns would alias one model and mix data.
-    ui.set_task_tids(slint::ModelRc::new(slint::VecModel::<slint::SharedString>::default()));
-    ui.set_task_types(slint::ModelRc::new(slint::VecModel::<slint::SharedString>::default()));
-    ui.set_task_states(slint::ModelRc::new(slint::VecModel::<slint::SharedString>::default()));
-    ui.set_task_prios(slint::ModelRc::new(slint::VecModel::<slint::SharedString>::default()));
-    ui.set_task_names(slint::ModelRc::new(slint::VecModel::<slint::SharedString>::default()));
-
-    // Bind the refresh-tasks callback from the Slint UI.
+    // Bind the refresh-tasks callback from the Slint UI. The worker already
+    // keeps the snapshot fresh; this just asks the next timer tick to copy
+    // the latest window into the models immediately.
     {
         let monitor = monitor.clone();
         let refresh_ui = ui.as_weak();
         ui.on_refresh_tasks(move || {
+            println!("[SCHED_MON] refresh");
             if let Some(ui) = refresh_ui.upgrade() {
                 let mut mon = monitor.borrow_mut();
-                mon.refresh_task_list(&ui);
+                mon.copy_task_window(&ui);
             }
         });
     }
 
     // Task list scroll: swipe-up/down adjust the window offset; the next tick
-    // (≤POLL_MS) re-slices the visible rows. No immediate refresh — matches
-    // the 2 Hz cadence and avoids a /proc read per swipe.
+    // (≤POLL_MS) re-slices the visible rows. No immediate /proc read — the
+    // worker owns the data.
     {
         let monitor = monitor.clone();
         ui.on_task_scroll_up(move || {
+            println!("[SCHED_MON] scroll up");
             monitor.borrow_mut().scroll_up();
         });
     }
     {
         let monitor = monitor.clone();
         ui.on_task_scroll_down(move || {
+            println!("[SCHED_MON] scroll down");
             monitor.borrow_mut().scroll_down();
         });
     }
@@ -619,5 +746,19 @@ pub(crate) fn install(ui: &MainWindow) -> slint::Timer {
             }
         },
     );
+
+    let page_active = std::rc::Rc::new(std::cell::Cell::new(false));
+    let active_state = page_active.clone();
+    ui.on_sched_mon_active_changed(move |active| {
+        if active_state.replace(active) == active {
+            return;
+        }
+        if active {
+            start_worker();
+        } else {
+            stop_worker();
+        }
+        println!("[PAGE] {} sched-mon", if active { "enter" } else { "exit" });
+    });
     timer
 }

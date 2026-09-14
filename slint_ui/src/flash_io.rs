@@ -194,12 +194,7 @@ impl FlashJournal {
     fn write_next(&mut self, device: &FlashDevice) -> Result<(usize, u32, u128)> {
         let slot = self.next_slot;
         let sequence = self.next_sequence;
-        let started_at = uptime_micros();
         let base = slot * SECTOR_SIZE;
-        println!(
-            "[FLASH] begin slot={} sequence={} offset=0x{:08x} previously_used={}",
-            slot, sequence, base, self.used[slot]
-        );
 
         device.erase_slot(slot).map_err(|error| {
             Error::new(
@@ -228,7 +223,6 @@ impl FlashJournal {
                 ),
             ));
         }
-        println!("[FLASH] erase verified slot={slot}");
 
         let mut payload = vec![0u8; PAYLOAD_SIZE];
         fill_payload(&mut payload, sequence);
@@ -303,13 +297,6 @@ impl FlashJournal {
             ));
         }
 
-        println!(
-            "[FLASH] verified slot={} sequence={} crc=0x{:08x} elapsed_us={}",
-            slot,
-            sequence,
-            crc,
-            uptime_micros().saturating_sub(started_at)
-        );
 
         self.used[slot] = true;
         let search_start = (slot + 1) % SLOT_COUNT;
@@ -318,7 +305,7 @@ impl FlashJournal {
             .find(|candidate| !self.used[*candidate])
             .unwrap_or(search_start);
         self.next_sequence = sequence.wrapping_add(1).max(1);
-        Ok((slot, sequence, uptime_micros().saturating_sub(started_at)))
+        Ok((slot, sequence, 0))
     }
 }
 
@@ -401,6 +388,12 @@ fn run_write_thread() {
             }
         }
     }
+    println!(
+        "[FLASH] done records={} wall_us={} avg_kbps={}",
+        RECORDS_DONE.load(Ordering::Relaxed),
+        RUN_WALL_MICROS.load(Ordering::Relaxed),
+        AVERAGE_KBPS.load(Ordering::Relaxed)
+    );
     RUN_ACTIVE.store(false, Ordering::Relaxed);
 }
 

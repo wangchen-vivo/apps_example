@@ -512,6 +512,7 @@ pub(crate) fn install(ui: &MainWindow) -> slint::Timer {
     let ui_weak = ui.as_weak();
     let callback_scanner = scanner.clone();
     ui.on_scan_requested(move || {
+        println!("[WIFI_SCAN] scan requested");
         if let Some(ui) = ui_weak.upgrade() {
             callback_scanner.borrow_mut().request_scan(&ui);
         }
@@ -519,7 +520,13 @@ pub(crate) fn install(ui: &MainWindow) -> slint::Timer {
 
     let ui_weak = ui.as_weak();
     let active_scanner = scanner.clone();
+    let page_active = std::rc::Rc::new(std::cell::Cell::new(false));
+    let active_state = page_active.clone();
     ui.on_wifi_page_active_changed(move |active| {
+        if active_state.replace(active) == active {
+            return;
+        }
+        println!("[PAGE] {} wifi", if active { "enter" } else { "exit" });
         if let Some(ui) = ui_weak.upgrade() {
             active_scanner.borrow_mut().set_page_active(&ui, active);
         }
@@ -528,6 +535,7 @@ pub(crate) fn install(ui: &MainWindow) -> slint::Timer {
     let ui_weak = ui.as_weak();
     let scroll_up_scanner = scanner.clone();
     ui.on_wifi_scroll_up(move || {
+        println!("[WIFI_SCAN] scroll up");
         if let Some(ui) = ui_weak.upgrade() {
             scroll_up_scanner.borrow_mut().scroll_up(&ui);
         }
@@ -536,6 +544,7 @@ pub(crate) fn install(ui: &MainWindow) -> slint::Timer {
     let ui_weak = ui.as_weak();
     let scroll_down_scanner = scanner.clone();
     ui.on_wifi_scroll_down(move || {
+        println!("[WIFI_SCAN] scroll down");
         if let Some(ui) = ui_weak.upgrade() {
             scroll_down_scanner.borrow_mut().scroll_down(&ui);
         }

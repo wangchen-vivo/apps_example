@@ -210,7 +210,7 @@ impl ImuPoller {
         if self.imu.is_none() {
             match ImuFile::open() {
                 Ok(imu) => {
-                    println!("IMU DEV OPEN OK");
+                    println!("[IMU] dev open ok");
                     self.imu = Some(imu);
                 }
                 Err(_) => {
@@ -292,7 +292,7 @@ impl ImuPoller {
         self.print_counter += 1;
         if self.print_counter % 20 == 0 {
             println!(
-                "IMU raw: a({:.3},{:.3},{:.3}) g({:.1},{:.1},{:.1}) | filtered: a({:.3},{:.3},{:.3}) g({:.2},{:.2},{:.2})",
+                "[IMU] raw a({:.3},{:.3},{:.3}) g({:.1},{:.1},{:.1}) | filtered a({:.3},{:.3},{:.3}) g({:.2},{:.2},{:.2})",
                 raw.accel_x, raw.accel_y, raw.accel_z,
                 raw.gyro_x, raw.gyro_y, raw.gyro_z,
                 accel_x, accel_y, accel_z,
@@ -318,5 +318,14 @@ pub(crate) fn install(ui: &MainWindow) -> slint::Timer {
             }
         },
     );
+
+    let page_active = std::rc::Rc::new(std::cell::Cell::new(false));
+    let active_state = page_active.clone();
+    ui.on_imu_page_active_changed(move |active| {
+        if active_state.replace(active) == active {
+            return;
+        }
+        println!("[PAGE] {} imu", if active { "enter" } else { "exit" });
+    });
     timer
 }

@@ -86,13 +86,15 @@ export component MainWindow inherits Window {
     in property <float> mem-total-kb: 0.0;
     in property <float> mem-used-kb: 0.0;
     in property <float> mem-max-used-kb: 0.0;
-    in property <[string]> task-tids;
-    in property <[string]> task-types;
-    in property <[string]> task-states;
-    in property <[string]> task-prios;
-    in property <[string]> task-names;
     in property <int> task-hidden: 0;
     in property <int> task-total: 0;
+    in property <int> task-page: 1;
+    in property <int> task-page-count: 1;
+    in property <string> task-col-tid: "";
+    in property <string> task-col-type: "";
+    in property <string> task-col-state: "";
+    in property <string> task-col-prio: "";
+    in property <string> task-col-name: "";
     callback refresh-tasks();
     callback task-scroll-up();
     callback task-scroll-down();
@@ -202,13 +204,15 @@ export component MainWindow inherits Window {
         mem-total-kb <=> root.mem-total-kb;
         mem-used-kb <=> root.mem-used-kb;
         mem-max-used-kb <=> root.mem-max-used-kb;
-        task-tids <=> root.task-tids;
-        task-types <=> root.task-types;
-        task-states <=> root.task-states;
-        task-prios <=> root.task-prios;
-        task-names <=> root.task-names;
         task-hidden <=> root.task-hidden;
         task-total <=> root.task-total;
+        task-page <=> root.task-page;
+        task-page-count <=> root.task-page-count;
+        task-col-tid <=> root.task-col-tid;
+        task-col-type <=> root.task-col-type;
+        task-col-state <=> root.task-col-state;
+        task-col-prio <=> root.task-col-prio;
+        task-col-name <=> root.task-col-name;
         refresh-tasks => { root.refresh-tasks(); }
         swipe-up(dx, dy) => { root.task-scroll-up(); }
         swipe-down(dx, dy) => { root.task-scroll-down(); }

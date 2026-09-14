@@ -61,7 +61,6 @@ thread_local! {
     static KEY3_LAST_HELD: Cell<bool> = const { Cell::new(false) };
     static OPEN_ERROR_LOGGED: Cell<bool> = const { Cell::new(false) };
     static READ_ERROR_LOGGED: Cell<bool> = const { Cell::new(false) };
-    static LAST_REPORT: Cell<Option<u8>> = const { Cell::new(None) };
 }
 
 use std::cell::{Cell, RefCell};
@@ -104,15 +103,6 @@ pub(crate) fn poll() {
             return;
         }
         let events = buf[0];
-        LAST_REPORT.with(|last| {
-            if last.replace(Some(events)) != Some(events) {
-                println!(
-                    "[KEYS] report=0x{events:02x} key2={} key3={}",
-                    (events & KEY2_HELD != 0) as u8,
-                    (events & KEY3_HELD != 0) as u8
-                );
-            }
-        });
 
         let key2_held = events & KEY2_HELD != 0;
         let key2_was_held = KEY2_LAST_HELD.replace(key2_held);

@@ -713,16 +713,21 @@ pub(crate) fn uptime_micros() -> u128 {
     (ts.tv_sec as u128) * 1_000_000 + (ts.tv_nsec as u128) / 1_000
 }
 
-/// Print a one-line heap snapshot read from /proc/meminfo.
+/// Print a one-line heap snapshot read from /proc/meminfo. Only prints when
+/// a tracked value actually changed, so the serial log does not flood with
+/// identical lines every interval.
 pub(crate) fn log_mem_snapshot() {
     use std::io::Read;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST_USED: AtomicU64 = AtomicU64::new(u64::MAX);
+    static LAST_FREE: AtomicU64 = AtomicU64::new(u64::MAX);
+    static LAST_MAX: AtomicU64 = AtomicU64::new(u64::MAX);
+
     let Ok(mut file) = std::fs::File::open("/proc/meminfo") else {
-        println!("[MEM] /proc/meminfo unavailable");
         return;
     };
     let mut buf = std::string::String::new();
     if file.read_to_string(&mut buf).is_err() {
-        println!("[MEM] /proc/meminfo read failed");
         return;
     }
     let (mut total, mut used, mut max_used, mut free, mut largest) =
@@ -738,6 +743,12 @@ pub(crate) fn log_mem_snapshot() {
             "MemLargestFree" => largest = v.unwrap_or(0),
             _ => {}
         }
+    }
+    if LAST_USED.swap(used, Ordering::Relaxed) == used
+        && LAST_FREE.swap(free, Ordering::Relaxed) == free
+        && LAST_MAX.swap(max_used, Ordering::Relaxed) == max_used
+    {
+        return;
     }
     println!(
         "[MEM] t={}s total={total} used={used} maxUsed={max_used} free={free} largest={largest} kB",

@@ -144,7 +144,13 @@ pub(crate) fn install(ui: &MainWindow) -> slint::Timer {
     let monitor = Rc::new(RefCell::new(BatteryMonitor::new()));
 
     let active_monitor = monitor.clone();
+    let page_active = std::rc::Rc::new(std::cell::Cell::new(false));
+    let active_state = page_active.clone();
     ui.on_battery_active_changed(move |active| {
+        if active_state.replace(active) == active {
+            return;
+        }
+        println!("[PAGE] {} battery", if active { "enter" } else { "exit" });
         active_monitor.borrow_mut().set_active(active);
     });
 

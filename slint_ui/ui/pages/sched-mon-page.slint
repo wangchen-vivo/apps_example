@@ -14,13 +14,20 @@ export component SchedMonPage inherits AppPage {
     in property <float> mem-total-kb: 0.0;
     in property <float> mem-used-kb: 0.0;
     in property <float> mem-max-used-kb: 0.0;
-    in property <[string]> task-tids;
-    in property <[string]> task-types;
-    in property <[string]> task-states;
-    in property <[string]> task-prios;
-    in property <[string]> task-names;
     in property <int> task-hidden: 0;
     in property <int> task-total: 0;
+    in property <int> task-page: 1;
+    in property <int> task-page-count: 1;
+    /// Task table as 5 column strings ("\n"-separated rows each). One Text per
+    /// column keeps column alignment to Slint's x layout (no space-padding),
+    /// and cuts the scene from 40 Text items to 5 — 40 separate Text elements
+    /// were fragmenting the heap and eventually OOM'd on the software
+    /// renderer's 14336-byte scene realloc.
+    in property <string> task-col-tid: "";
+    in property <string> task-col-type: "";
+    in property <string> task-col-state: "";
+    in property <string> task-col-prio: "";
+    in property <string> task-col-name: "";
     callback refresh-tasks();
 
     title: "CPU与内存";
@@ -65,7 +72,7 @@ export component SchedMonPage inherits AppPage {
     // ====== 任务列表区块 ======
     Rectangle { x: 24px; y: 182px; width: 6px; height: 18px; background: #86efac; border-radius: 3px; }
     Text { x: 38px; y: 178px; width: 200px; height: 26px; text: "任务列表"; color: #86efac; font-size: Theme.font-base; font-weight: 700; vertical-alignment: center; }
-    Text { x: 130px; y: 182px; width: 100px; height: 22px; text: "1-" + (root.task-total - root.task-hidden) + "/" + root.task-total + " 项"; color: Theme.muted-text; font-size: Theme.font-sm; vertical-alignment: center; }
+    Text { x: 130px; y: 182px; width: 100px; height: 22px; text: root.task-page + "/" + root.task-page-count + " 页"; color: Theme.muted-text; font-size: Theme.font-sm; vertical-alignment: center; }
 
     // Column headers (absolute x = 24 + relative x):
     //   TID 0/40  类型 42/56  状态 100/80  优先级 182/40  名称 224/172
@@ -75,25 +82,13 @@ export component SchedMonPage inherits AppPage {
     Text { x: 216px; y: 212px; width: 56px;  height: 20px; text: "优先级"; color: Theme.muted-text; font-size: Theme.font-sm; font-weight: 700; vertical-alignment: center; }
     Text { x: 284px; y: 212px; width: 148px; height: 20px; text: "名称";   color: Theme.muted-text; font-size: Theme.font-sm; font-weight: 700; vertical-alignment: center; }
 
-    // Task rows — 8 visible rows, 22px each (234..410).
-    for idx in 8 : Rectangle {
-        x: 24px; y: 234px + idx * 22px;
-        width: 432px; height: 20px;
-
-        Text { x: 0px;   width: 40px;  height: parent.height; text: root.task-tids[idx];   color: Theme.secondary-text; font-size: Theme.font-sm; font-weight: 600; vertical-alignment: center; }
-        Text { x: 48px;  width: 56px;  height: parent.height; text: root.task-types[idx];  color: Theme.secondary-text; font-size: Theme.font-sm; font-weight: 600; vertical-alignment: center; }
-        Text { x: 106px; width: 80px;  height: parent.height; text: root.task-states[idx]; color: Theme.secondary-text; font-size: Theme.font-sm; font-weight: 600; vertical-alignment: center; }
-        Text { x: 192px; width: 56px;  height: parent.height; text: root.task-prios[idx];  color: Theme.secondary-text; font-size: Theme.font-sm; font-weight: 600; vertical-alignment: center; }
-        Text { x: 260px; width: 172px; height: parent.height; text: root.task-names[idx];  color: Theme.secondary-text; font-size: Theme.font-sm; font-weight: 600; vertical-alignment: center; overflow: elide; }
-    }
-
-    // "还有 N 个任务" — tasks below the visible window.
-    Text {
-        x: 24px; y: 414px; width: 432px; height: 14px;
-        visible: root.task-hidden > 0;
-        text: "还有 " + root.task-hidden + " 个任务";
-        color: Theme.muted-text; font-size: Theme.font-sm; font-weight: 400;
-        vertical-alignment: center;
-        horizontal-alignment: right;
-    }
+    // Task rows — one Text per column, each column is an 8-line string
+    // ("\n"-separated rows built in Rust). Column x-positions come from Slint
+    // layout so values align regardless of font advance widths. 5 Text items
+    // total (vs 40 cells) keeps the software renderer's scene allocation low.
+    Text { x: 24px;  y: 234px; width: 40px;  height: 176px; text: root.task-col-tid;   color: Theme.secondary-text; font-size: Theme.font-sm; font-weight: 600; vertical-alignment: top; wrap: no-wrap; overflow: elide; }
+    Text { x: 72px;  y: 234px; width: 56px;  height: 176px; text: root.task-col-type;  color: Theme.secondary-text; font-size: Theme.font-sm; font-weight: 600; vertical-alignment: top; wrap: no-wrap; overflow: elide; }
+    Text { x: 130px; y: 234px; width: 80px;  height: 176px; text: root.task-col-state; color: Theme.secondary-text; font-size: Theme.font-sm; font-weight: 600; vertical-alignment: top; wrap: no-wrap; overflow: elide; }
+    Text { x: 216px; y: 234px; width: 56px;  height: 176px; text: root.task-col-prio;  color: Theme.secondary-text; font-size: Theme.font-sm; font-weight: 600; vertical-alignment: top; wrap: no-wrap; overflow: elide; }
+    Text { x: 284px; y: 234px; width: 148px; height: 176px; text: root.task-col-name;  color: Theme.secondary-text; font-size: Theme.font-sm; font-weight: 600; vertical-alignment: top; wrap: no-wrap; overflow: elide; }
 }
