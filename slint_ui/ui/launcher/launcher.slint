@@ -30,6 +30,7 @@ export component Launcher inherits Rectangle {
     property <bool> icon8-pressed: false;
     property <bool> icon9-pressed: false;
     property <bool> icon10-pressed: false;
+    property <bool> icon-power-pressed: false;
 
     // Content area. Page changes are driven by horizontal swipes.
     Rectangle {
@@ -168,6 +169,13 @@ export component Launcher inherits Rectangle {
                     pressed: root.icon8-pressed;
                     clicked => { root.open-app(15); }
                 }
+                icon-power := DemoIcon {
+                    x: 312px; y: 220px;
+                    icon-text: Icons.power; label: "电源";
+                    accent: #f0bd62;
+                    pressed: root.icon-power-pressed;
+                    clicked => { root.open-app(17); }
+                }
             }
         }
     }
@@ -227,6 +235,7 @@ export component Launcher inherits Rectangle {
             // col 2 (x=312): range [480+312+inset, 480+432-inset] = [804, 900]
             } else if c >= 804.0 && c < 900.0 {
                 if my >= 30.0 && my < 200.0 { root.open-app(13); }
+                else if my >= 220.0 && my < 390.0 { root.open-app(17); }
             }
         }
     }
@@ -256,6 +265,7 @@ export component Launcher inherits Rectangle {
                 else if my >= 220.0 && my < 390.0 { root.icon8-pressed = true; }
             } else if c >= 804.0 && c < 900.0 {
                 if my >= 30.0 && my < 200.0 { root.icon6-pressed = true; }
+                else if my >= 220.0 && my < 390.0 { root.icon-power-pressed = true; }
             }
         }
     }
@@ -272,5 +282,6 @@ export component Launcher inherits Rectangle {
         root.icon8-pressed = false;
         root.icon9-pressed = false;
         root.icon10-pressed = false;
+        root.icon-power-pressed = false;
     }
 }

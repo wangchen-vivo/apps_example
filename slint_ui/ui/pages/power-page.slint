@@ -1,0 +1,68 @@
+// Power control page: reboot and shutdown actions.
+
+import { AppPage } from "../components/app-page.slint";
+import { Theme } from "../components/theme.slint";
+
+export component PowerPage inherits AppPage {
+    callback power-off();
+    callback reboot();
+
+    title: "电源";
+    accent: #f0bd62;
+
+    // Reboot button.
+    Rectangle {
+        x: 60px;
+        y: 110px;
+        width: 360px;
+        height: 90px;
+        background: reboot-area.pressed ? Theme.pressed-background : Theme.raised-background;
+        border-width: 2px;
+        border-color: Theme.border-color;
+        border-radius: 16px;
+
+        Text {
+            width: parent.width;
+            height: parent.height;
+            text: "重启";
+            color: Theme.primary-text;
+            font-size: Theme.font-lg;
+            font-weight: 800;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+
+        reboot-area := TouchArea {
+            width: parent.width;
+            height: parent.height;
+            clicked => { root.reboot(); }
+        }
+    }
+
+    // Shutdown button — danger accent.
+    Rectangle {
+        x: 60px;
+        y: 240px;
+        width: 360px;
+        height: 90px;
+        background: shutdown-area.pressed ? #7a2a2a : #3a1818;
+        border-radius: 16px;
+
+        Text {
+            width: parent.width;
+            height: parent.height;
+            text: "关机";
+            color: #f06060;
+            font-size: Theme.font-lg;
+            font-weight: 800;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+
+        shutdown-area := TouchArea {
+            width: parent.width;
+            height: parent.height;
+            clicked => { root.power-off(); }
+        }
+    }
+}

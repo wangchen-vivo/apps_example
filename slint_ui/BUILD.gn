@@ -46,6 +46,7 @@ action("generate_slint_ui") {
     "ui/pages/file-io-page.slint",
     "ui/pages/metals-page.slint",
     "ui/pages/audio-page.slint",
+    "ui/pages/power-page.slint",
     "resources/website-text.ttf",
     "resources/website-glyphs.slint",
     "resources/blueos-icons.ttf",

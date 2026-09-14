@@ -878,6 +878,26 @@ fn run_slint_ui() -> IoResult<()> {
     brightness::install(&ui);
     let _audio_timer = audio::install(&ui);
 
+    // Power page: drive the PMU through /dev/battery text commands.
+    // "reset" = CPU/peripheral reset (chip ROM routine, power stays on);
+    // "poweroff" = PMU shutdown (board stays off until the PWR key).
+    ui.on_reboot(|| {
+        // Darken the screen first: the AMOLED holds its last frame through
+        // the reset (CPU reset does not drop the display rail).
+        screen_dark();
+        if let Err(e) = battery_command(b"reset") {
+            println!("[POWER] reset failed: {e}");
+        }
+    });
+    ui.on_power_off(|| {
+        // Darken the screen first: the AMOLED holds its last frame while
+        // its rail stays powered through the PMU shutdown sequence.
+        screen_dark();
+        if let Err(e) = battery_command(b"poweroff") {
+            println!("[POWER] poweroff failed: {e}");
+        }
+    });
+
     ui.on_debug(|msg| {
         println!("[DEBUG] {}", msg);
     });
@@ -886,6 +906,40 @@ fn run_slint_ui() -> IoResult<()> {
         .map_err(|err| Error::new(ErrorKind::Other, err.to_string()))?;
 
     slint::run_event_loop().map_err(|err| Error::new(ErrorKind::Other, err.to_string()))
+}
+
+/// Write a text command to /dev/battery (the AXP2101 PMU interface).
+/// "reset" reboots the SoC (ROM software reset, power stays on);
+/// "poweroff" shuts the board down until the PWR key is pressed.
+fn battery_command(cmd: &[u8]) -> IoResult<()> {
+    let path = CStr::from_bytes_with_nul(b"/dev/battery\0")
+        .map_err(|_| Error::from_raw_os_error(libc::EINVAL))?;
+    let fd = librs::syscall::sys::Sys::open(path, libc::O_WRONLY, 0);
+    if fd < 0 {
+        return Err(Error::from_raw_os_error(-fd));
+    }
+    let write_result = librs::syscall::sys::Sys::write(fd, cmd);
+    let close_result = librs::syscall::sys::Sys::close(fd);
+    match (write_result, close_result) {
+        (Ok(_), Ok(())) => Ok(()),
+        (Err(librs::errno::Errno(errno)), _) => Err(Error::from_raw_os_error(errno)),
+        (_, Err(librs::errno::Errno(errno))) => Err(Error::from_raw_os_error(errno)),
+    }
+}
+
+/// Darken the display before a power-off. The AMOLED keeps showing its last
+/// frame while its rail stays powered during the PMU shutdown sequence.
+fn screen_dark() {
+    let path = match CStr::from_bytes_with_nul(b"/dev/backlight\0") {
+        Ok(path) => path,
+        Err(_) => return,
+    };
+    let fd = librs::syscall::sys::Sys::open(path, libc::O_WRONLY, 0);
+    if fd < 0 {
+        return;
+    }
+    let _ = librs::syscall::sys::Sys::write(fd, b"0");
+    let _ = librs::syscall::sys::Sys::close(fd);
 }
 
 fn main() -> IoResult<()> {

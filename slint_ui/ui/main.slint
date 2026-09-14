@@ -16,6 +16,7 @@ import { FileIoPage } from "./pages/file-io-page.slint";
 import { MetalsPage } from "./pages/metals-page.slint";
 import { TouchPage } from "./pages/touch-page.slint";
 import { AudioPage } from "./pages/audio-page.slint";
+import { PowerPage } from "./pages/power-page.slint";
 import "../resources/website-text.ttf";
 import "../resources/blueos-icons.ttf";
 import { WebsiteGlyphs } from "../resources/website-glyphs.slint";
@@ -132,6 +133,8 @@ export component MainWindow inherits Window {
     callback audio-stop();
     callback set-audio-volume(int);
     callback audio-page-active-changed(bool);
+    callback power-off();
+    callback reboot();
     callback sd-page-active-changed(bool);
     callback sd-entry-selected(int);
     callback sd-up-requested();
@@ -352,4 +355,10 @@ export component MainWindow inherits Window {
         go-back => { root.current-app = -1; } go-home => { root.current-app = -1; }
     }
     if current-app == 16: TouchPage { go-back => { root.current-app = -1; } go-home => { root.current-app = -1; } }
+    if current-app == 17: PowerPage {
+        power-off => { root.power-off(); }
+        reboot => { root.reboot(); }
+        swipe-right(dx, dy) => { root.current-app = -1; }
+        go-back => { root.current-app = -1; } go-home => { root.current-app = -1; }
+    }
 }
