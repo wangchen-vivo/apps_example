@@ -18,7 +18,7 @@ use slint::ComponentHandle;
 use std::{
     cell::RefCell,
     io::{Error, ErrorKind, Result},
-    rc::Rc,
+    sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering},
 };
 
 const DEVICE_PATH: &[u8] = b"/dev/esp32-flash0\0";
@@ -33,6 +33,25 @@ const MAGIC: u32 = 0x4246_494f;
 const FORMAT_VERSION: u32 = 1;
 const COMMIT_MARKER: u32 = 0x434f_4d4d;
 const COMMIT_OFFSET: usize = 24;
+/// The writer thread's locals are three 4 KiB buffers plus the journal; 32 KiB
+/// gives headroom without stressing the heap-backed thread stacks.
+const FLASH_THREAD_STACK_SIZE: usize = 32 * 1024;
+
+// Playback state shared between the writer thread (producer) and the UI
+// thread (consumer). MainWindow is !Send, so the writer thread cannot touch
+// the UI; it publishes progress here and the UI timer polls these.
+// KiB values fit i32; elapsed micros need u64.
+static RUN_ACTIVE: AtomicBool = AtomicBool::new(false);
+static RECORDS_DONE: AtomicU32 = AtomicU32::new(0);
+static SPEED_KBPS: AtomicI32 = AtomicI32::new(0);
+static AVERAGE_KBPS: AtomicI32 = AtomicI32::new(0);
+static LAST_SLOT: AtomicU32 = AtomicU32::new(0);
+static LAST_SEQUENCE: AtomicU32 = AtomicU32::new(0);
+// Wall-clock span of the run, published by the writer thread. The average
+// speed divides bytes by this span, so the displayed rate matches a stopwatch
+// instead of only counting the flash-busy window inside each record.
+static RUN_WALL_MICROS: AtomicU64 = AtomicU64::new(0);
+static RUN_FAILED: AtomicBool = AtomicBool::new(false);
 
 #[repr(C)]
 struct EraseRangeRequest {
@@ -302,78 +321,70 @@ impl FlashJournal {
     }
 }
 
-struct Controller {
-    device: Option<FlashDevice>,
-    journal: Option<FlashJournal>,
-    remaining: usize,
-    completed: usize,
-    total_micros: u128,
-}
+/// Writer-thread body: writes RECORDS_PER_RUN records back to back with no
+/// pacing, then publishes the final state. Running without tick gaps keeps
+/// the wall-clock span equal to the flash work, so the reported average
+/// speed is the real throughput. UI updates happen via the atomics above;
+/// this thread must never touch MainWindow (it is !Send).
+///
+/// Exit paths: completing all records, a write error, or RUN_ACTIVE going
+/// false (page closed / new run) at the next record boundary. A record is
+/// never abandoned mid-way: erase/program/verify/commit always complete.
+fn run_write_thread() {
+    RUN_FAILED.store(false, Ordering::Relaxed);
+    RECORDS_DONE.store(0, Ordering::Relaxed);
+    SPEED_KBPS.store(0, Ordering::Relaxed);
+    AVERAGE_KBPS.store(0, Ordering::Relaxed);
+    RUN_WALL_MICROS.store(0, Ordering::Relaxed);
 
-impl Controller {
-    fn new() -> Self {
-        Self {
-            device: None,
-            journal: None,
-            remaining: 0,
-            completed: 0,
-            total_micros: 0,
-        }
-    }
-
-    fn start(&mut self, ui: &MainWindow) -> Result<()> {
-        if self.device.is_none() {
-            println!("[FLASH_IO] opening /dev/esp32-flash0");
-            let device = FlashDevice::open()?;
-            let journal = FlashJournal::scan(&device)?;
-            self.device = Some(device);
-            self.journal = Some(journal);
-        }
-        self.remaining = RECORDS_PER_RUN;
-        self.completed = 0;
-        self.total_micros = 0;
-        ui.set_flash_bytes_written(0);
-        ui.set_flash_speed_kbps(0);
-        ui.set_flash_average_kbps(0);
-        ui.set_flash_running(true);
-        ui.set_flash_status_text("正在写入 Flash 槽位".into());
-        Ok(())
-    }
-
-    fn tick(&mut self, ui: &MainWindow) {
-        if self.remaining == 0 {
+    let run_start = uptime_micros();
+    let device = match FlashDevice::open() {
+        Ok(device) => device,
+        Err(error) => {
+            println!("[FLASH_IO] open failed: {error}");
+            RUN_FAILED.store(true, Ordering::Relaxed);
+            RUN_ACTIVE.store(false, Ordering::Relaxed);
             return;
         }
-        let result = self
-            .journal
-            .as_mut()
-            .unwrap()
-            .write_next(self.device.as_ref().unwrap());
-        match result {
-            Ok((slot, sequence, elapsed)) => {
-                self.remaining -= 1;
-                self.completed += 1;
-                self.total_micros = self.total_micros.saturating_add(elapsed);
-                let live = throughput_kib(elapsed, 1);
-                let average = throughput_kib(self.total_micros, self.completed);
-                ui.set_flash_slot(slot as i32);
-                ui.set_flash_sequence(sequence as i32);
-                ui.set_flash_bytes_written((self.completed * 4) as i32);
-                ui.set_flash_speed_kbps(live);
-                ui.set_flash_average_kbps(average);
-                if self.remaining == 0 {
-                    ui.set_flash_running(false);
-                    ui.set_flash_status_text("写入并校验通过".into());
-                }
+    };
+    let mut journal = match FlashJournal::scan(&device) {
+        Ok(journal) => journal,
+        Err(error) => {
+            println!("[FLASH_IO] scan failed: {error}");
+            RUN_FAILED.store(true, Ordering::Relaxed);
+            RUN_ACTIVE.store(false, Ordering::Relaxed);
+            return;
+        }
+    };
+
+    for _ in 0..RECORDS_PER_RUN {
+        if !RUN_ACTIVE.load(Ordering::Relaxed) {
+            // A new run replaced this one; stop quietly.
+            return;
+        }
+        match journal.write_next(&device) {
+            Ok((slot, sequence, _busy_us)) => {
+                let done = RECORDS_DONE.load(Ordering::Relaxed) + 1;
+                RECORDS_DONE.store(done, Ordering::Relaxed);
+                LAST_SLOT.store(slot as u32, Ordering::Relaxed);
+                LAST_SEQUENCE.store(sequence, Ordering::Relaxed);
+                // Publish through the last completed record: the wall span
+                // includes every scheduling gap, so the average is honest.
+                let wall = uptime_micros().saturating_sub(run_start);
+                RUN_WALL_MICROS.store(wall as u64, Ordering::Relaxed);
+                let done = done as usize;
+                SPEED_KBPS.store(throughput_kib(wall, done), Ordering::Relaxed);
+                AVERAGE_KBPS.store(throughput_kib(wall, done), Ordering::Relaxed);
             }
             Err(error) => {
                 println!("[FLASH_IO] failed: {error}");
-                self.remaining = 0;
-                ui.set_flash_running(false);
-                ui.set_flash_status_text(format!("Flash 错误: {error}").into());
+                RUN_FAILED.store(true, Ordering::Relaxed);
+                RUN_ACTIVE.store(false, Ordering::Relaxed);
+                return;
             }
         }
     }
+    RUN_ACTIVE.store(false, Ordering::Relaxed);
 }
 
 fn read_u32(bytes: &[u8], offset: usize) -> u32 {
@@ -413,27 +424,102 @@ fn throughput_kib(micros: u128, records: usize) -> i32 {
         as i32
 }
 
+thread_local! {
+    /// Handle of the running writer thread. The UI thread holds it so the
+    /// page-exit path can join the thread before dropping it.
+    static WRITER_THREAD: RefCell<Option<std::thread::JoinHandle<()>>> =
+        const { RefCell::new(None) };
+}
+
+/// Abort the running writer thread and wait for it to exit. The thread only
+/// checks RUN_ACTIVE between records, so join() waits at most one record's
+/// flash time (~110 ms) — a record in flight always completes its
+/// erase/program/verify/commit cycle before the thread stops.
+fn abort_writer_thread() {
+    RUN_ACTIVE.store(false, Ordering::Relaxed);
+    WRITER_THREAD.with(|slot| {
+        if let Some(handle) = slot.borrow_mut().take() {
+            let _ = handle.join();
+        }
+    });
+}
+
 pub(crate) fn install(ui: &MainWindow) -> slint::Timer {
-    let controller = Rc::new(RefCell::new(Controller::new()));
-    let callback_controller = controller.clone();
     let ui_weak = ui.as_weak();
     ui.on_flash_start_requested(move || {
-        if let Some(ui) = ui_weak.upgrade() {
-            if let Err(error) = callback_controller.borrow_mut().start(&ui) {
+        let Some(ui) = ui_weak.upgrade() else {
+            return;
+        };
+        // Refuse to start while a run is in flight: the writer thread owns
+        // the flash device, and two writers would corrupt the journal walk.
+        if RUN_ACTIVE.load(Ordering::Relaxed) {
+            return;
+        }
+        RUN_ACTIVE.store(true, Ordering::Relaxed);
+        ui.set_flash_bytes_written(0);
+        ui.set_flash_speed_kbps(0);
+        ui.set_flash_average_kbps(0);
+        ui.set_flash_running(true);
+        ui.set_flash_status_text("正在写入 Flash 槽位".into());
+        match std::thread::Builder::new()
+            .stack_size(FLASH_THREAD_STACK_SIZE)
+            .spawn(run_write_thread)
+        {
+            Ok(handle) => {
+                WRITER_THREAD.with(|slot| *slot.borrow_mut() = Some(handle));
+            }
+            Err(error) => {
+                println!("[FLASH_IO] thread spawn failed: {error}");
+                RUN_ACTIVE.store(false, Ordering::Relaxed);
                 ui.set_flash_running(false);
-                ui.set_flash_status_text(format!("Flash 不可用: {error}").into());
+                ui.set_flash_status_text(format!("线程启动失败: {error}").into());
             }
         }
     });
 
+    // Leaving the page recycles the writer thread: flip RUN_ACTIVE so the
+    // thread stops at the next record boundary, then join it here (bounded
+    // by one record's flash time). Re-entering shows the aborted state and
+    // START becomes available again.
+    let ui_weak2 = ui.as_weak();
+    ui.on_flash_page_active_changed(move |active| {
+        if !active {
+            abort_writer_thread();
+            if let Some(ui) = ui_weak2.upgrade() {
+                ui.set_flash_running(false);
+                ui.set_flash_status_text("已中止".into());
+            }
+        }
+    });
+
+    // UI-side poller: mirrors the writer thread's atomics into the Slint
+    // properties. MainWindow is !Send, so all UI mutations stay on this
+    // (event-loop) thread; the 30ms cadence only affects display latency.
     let timer = slint::Timer::default();
     let ui_weak = ui.as_weak();
     timer.start(
         slint::TimerMode::Repeated,
         std::time::Duration::from_millis(30),
         move || {
-            if let Some(ui) = ui_weak.upgrade() {
-                controller.borrow_mut().tick(&ui);
+            let Some(ui) = ui_weak.upgrade() else {
+                return;
+            };
+            let done = RECORDS_DONE.load(Ordering::Relaxed);
+            ui.set_flash_bytes_written((done * 4) as i32);
+            ui.set_flash_speed_kbps(SPEED_KBPS.load(Ordering::Relaxed));
+            ui.set_flash_average_kbps(AVERAGE_KBPS.load(Ordering::Relaxed));
+            ui.set_flash_slot(LAST_SLOT.load(Ordering::Relaxed) as i32);
+            ui.set_flash_sequence(LAST_SEQUENCE.load(Ordering::Relaxed) as i32);
+            if RUN_ACTIVE.load(Ordering::Relaxed) {
+                return;
+            }
+            // Run finished: show the final verdict once. The failed flag is
+            // cleared by the next run's writer thread.
+            ui.set_flash_running(false);
+            if RUN_FAILED.load(Ordering::Relaxed) {
+                ui.set_flash_status_text("Flash 错误，见串口日志".into());
+            } else {
+                ui.set_flash_status_text("写入并校验通过".into());
             }
         },
     );

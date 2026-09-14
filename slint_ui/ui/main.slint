@@ -58,6 +58,7 @@ export component MainWindow inherits Window {
     in-out property <int> flash-sequence: 0;
     in-out property <string> flash-status-text: "点按 START 写入并校验 Flash";
     callback flash-start-requested();
+    callback flash-page-active-changed(bool);
 
     // Gold & silver price page (metals.rs drives these).
     in-out property <string> metals-time: "--:--";
@@ -149,6 +150,7 @@ export component MainWindow inherits Window {
         root.brightness-page-active-changed(root.current-app == 10);
         root.metals-active-changed(root.current-app == 14);
         root.audio-page-active-changed(root.current-app == 15);
+        root.flash-page-active-changed(root.current-app == 8);
         if root.current-app != 13 {
             root.sd-image-open = false;
             root.sd-audio-open = false;
