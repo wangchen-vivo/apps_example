@@ -52,6 +52,9 @@ static LAST_SEQUENCE: AtomicU32 = AtomicU32::new(0);
 // instead of only counting the flash-busy window inside each record.
 static RUN_WALL_MICROS: AtomicU64 = AtomicU64::new(0);
 static RUN_FAILED: AtomicBool = AtomicBool::new(false);
+/// Set when the run-end branch has done its one-shot work (join + verdict),
+/// cleared by the next start. Without it the branch re-runs every 30ms tick.
+static RUN_END_HANDLED: AtomicBool = AtomicBool::new(false);
 
 #[repr(C)]
 struct EraseRangeRequest {
@@ -426,23 +429,55 @@ fn throughput_kib(micros: u128, records: usize) -> i32 {
 
 thread_local! {
     /// Handle of the running writer thread. The UI thread holds it so the
-    /// page-exit path can join the thread before dropping it.
+    /// run-end / page-exit paths can join the thread.
     static WRITER_THREAD: RefCell<Option<std::thread::JoinHandle<()>>> =
         const { RefCell::new(None) };
 }
 
-/// Abort the running writer thread and wait for it to exit. The thread only
-/// checks RUN_ACTIVE between records, so join() waits at most one record's
-/// flash time (~110 ms) — a record in flight always completes its
-/// erase/program/verify/commit cycle before the thread stops.
-fn abort_writer_thread() {
-    RUN_ACTIVE.store(false, Ordering::Relaxed);
+/// Join the writer thread, releasing its stack. Joinable librs threads block
+/// in pthread_exit at a barrier until someone joins them — a run left
+/// unjoined leaks its whole 24 KiB thread storage and the next spawn panics
+/// on the exhausted heap. join() waits at most one record's flash time
+/// (~110 ms) while a run is active (stop signal honored at record
+/// boundaries); after a natural finish it returns immediately.
+fn join_writer_thread() {
     WRITER_THREAD.with(|slot| {
         if let Some(handle) = slot.borrow_mut().take() {
             let _ = handle.join();
         }
     });
 }
+
+/// Stop the writer thread (abort signal at the next record boundary) and
+/// reclaim its stack.
+fn abort_writer_thread() {
+    RUN_ACTIVE.store(false, Ordering::Relaxed);
+    join_writer_thread();
+}
+
+// ---------------------------------------------------------------------------
+// Diagnostic heap snapshot (temporary, for the double-START panic probe):
+// reads /proc/meminfo and prints total/used/largest-free. The interesting
+// field is MemLargestFree — pthread_create needs a contiguous 24 KiB block;
+// an allocation failure there panics inside librs (assert on NULL).
+// ---------------------------------------------------------------------------
+fn log_heap(tag: &str) {
+    use std::io::Read;
+    let Ok(mut file) = std::fs::File::open("/proc/meminfo") else {
+        println!("[FLASH_IO-HM] {tag}: /proc/meminfo unavailable");
+        return;
+    };
+    let mut buf = std::string::String::new();
+    if file.read_to_string(&mut buf).is_err() {
+        println!("[FLASH_IO-HM] {tag}: read failed");
+        return;
+    }
+    // Forward the kernel's own lines, tagged with the probe point.
+    for line in buf.lines() {
+        println!("[FLASH_IO-HM] {tag} {}", line.trim());
+    }
+}
+
 
 pub(crate) fn install(ui: &MainWindow) -> slint::Timer {
     let ui_weak = ui.as_weak();
@@ -456,7 +491,8 @@ pub(crate) fn install(ui: &MainWindow) -> slint::Timer {
             return;
         }
         RUN_ACTIVE.store(true, Ordering::Relaxed);
-        ui.set_flash_bytes_written(0);
+        RUN_END_HANDLED.store(false, Ordering::Relaxed);
+        log_heap("pre-spawn");        ui.set_flash_bytes_written(0);
         ui.set_flash_speed_kbps(0);
         ui.set_flash_average_kbps(0);
         ui.set_flash_running(true);
@@ -469,6 +505,7 @@ pub(crate) fn install(ui: &MainWindow) -> slint::Timer {
                 WRITER_THREAD.with(|slot| *slot.borrow_mut() = Some(handle));
             }
             Err(error) => {
+                log_heap("spawn-fail");
                 println!("[FLASH_IO] thread spawn failed: {error}");
                 RUN_ACTIVE.store(false, Ordering::Relaxed);
                 ui.set_flash_running(false);
@@ -510,12 +547,18 @@ pub(crate) fn install(ui: &MainWindow) -> slint::Timer {
             ui.set_flash_average_kbps(AVERAGE_KBPS.load(Ordering::Relaxed));
             ui.set_flash_slot(LAST_SLOT.load(Ordering::Relaxed) as i32);
             ui.set_flash_sequence(LAST_SEQUENCE.load(Ordering::Relaxed) as i32);
-            if RUN_ACTIVE.load(Ordering::Relaxed) {
+            if RUN_ACTIVE.load(Ordering::Relaxed) || RUN_END_HANDLED.swap(true, Ordering::Relaxed) {
                 return;
             }
-            // Run finished: show the final verdict once. The failed flag is
-            // cleared by the next run's writer thread.
+            // Run finished (first tick after completion only): reclaim the
+            // writer thread's stack right away (a joinable librs thread
+            // blocks in pthread_exit until joined; leaving it unjoined leaks
+            // its 24 KiB storage and the next spawn panics on the exhausted
+            // heap), then show the verdict. RUN_END_HANDLED is cleared by
+            // the next start.
             ui.set_flash_running(false);
+            join_writer_thread();
+            log_heap("post-join");
             if RUN_FAILED.load(Ordering::Relaxed) {
                 ui.set_flash_status_text("Flash 错误，见串口日志".into());
             } else {
