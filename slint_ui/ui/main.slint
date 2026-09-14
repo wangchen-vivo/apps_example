@@ -31,6 +31,7 @@ export component MainWindow inherits Window {
     in-out property <int> current-app: -1;  // -1 = launcher, 6+ = app pages
     property <int> current-tab: 0;   // 0 = 内核, 1 = 外设
     property <float> tab-offset: 0.0;
+    callback app-changed(int);
 
     in property <[WifiNetwork]> networks;
     in-out property <bool> scanning: false;
@@ -94,6 +95,7 @@ export component MainWindow inherits Window {
     callback refresh-tasks();
     callback task-scroll-up();
     callback task-scroll-down();
+    callback sched-mon-active-changed(bool);
 
     in-out property <string> accel-x: "---";
     in-out property <string> accel-y: "---";
@@ -101,6 +103,7 @@ export component MainWindow inherits Window {
     in-out property <string> gyro-x: "---";
     in-out property <string> gyro-y: "---";
     in-out property <string> gyro-z: "---";
+    callback imu-page-active-changed(bool);
 
     in property <[SdFileEntry]> sd-entries;
     in-out property <string> sd-path-text: "/data";
@@ -123,6 +126,7 @@ export component MainWindow inherits Window {
     in-out property <string> sd-image-status: "";
     in-out property <bool> sd-audio-open: false;
     in-out property <string> sd-audio-title: "";
+    in-out property <string> sd-audio-size: "";
     in-out property <string> sd-audio-status: "";
     in-out property <bool> sd-audio-playing: false;
     // Audio page properties
@@ -148,8 +152,11 @@ export component MainWindow inherits Window {
     callback sd-close-audio();
 
     changed current-app => {
+        root.app-changed(root.current-app);
+        root.sched-mon-active-changed(root.current-app == 6);
         root.battery-active-changed(root.current-app == 7);
         root.wifi-page-active-changed(root.current-app == 11);
+        root.imu-page-active-changed(root.current-app == 12);
         root.sd-page-active-changed(root.current-app == 13);
         root.brightness-page-active-changed(root.current-app == 10);
         root.metals-active-changed(root.current-app == 14);
@@ -280,9 +287,9 @@ export component MainWindow inherits Window {
         close-image => { root.sd-close-image(); }
         audio-open <=> root.sd-audio-open;
         audio-title <=> root.sd-audio-title;
+        audio-size <=> root.sd-audio-size;
         audio-status <=> root.sd-audio-status;
         audio-playing <=> root.sd-audio-playing;
-        main-audio-status: root.audio-status;
         audio-volume <=> root.audio-volume;
         audio-play => { root.audio-play(); }
         audio-stop => { root.audio-stop(); }

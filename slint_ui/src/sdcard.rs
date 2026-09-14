@@ -336,7 +336,8 @@ impl SdBrowser {
         match crate::audio::play_file(ui, path) {
             Ok(()) => {
                 ui.set_sd_audio_title(name.into());
-                ui.set_sd_audio_status(format_size(size).into());
+                ui.set_sd_audio_size(format_size(size).into());
+                ui.set_sd_audio_status("点击播放".into());
                 ui.set_sd_audio_open(true);
                 println!("[SDCARD] opened WAV {path}");
             }
@@ -509,7 +510,13 @@ pub(crate) fn install(ui: &MainWindow, png_state: SharedPngRenderState) {
     let ui_weak = ui.as_weak();
     let callback_browser = browser.clone();
     let callback_audit_done = audit_done.clone();
+    let page_active = std::rc::Rc::new(std::cell::Cell::new(false));
+    let active_state = page_active.clone();
     ui.on_sd_page_active_changed(move |active| {
+        if active_state.replace(active) == active {
+            return;
+        }
+        println!("[PAGE] {} sdcard", if active { "enter" } else { "exit" });
         if !active {
             // Reset PNG viewer state when leaving the SD card page
             let mut s = png_state.borrow_mut();
@@ -533,6 +540,7 @@ pub(crate) fn install(ui: &MainWindow, png_state: SharedPngRenderState) {
     let ui_weak = ui.as_weak();
     let callback_browser = browser.clone();
     ui.on_sd_refresh_requested(move || {
+        println!("[SDCARD] refresh");
         if let Some(ui) = ui_weak.upgrade() {
             callback_browser.borrow_mut().refresh(&ui);
         }
@@ -541,6 +549,7 @@ pub(crate) fn install(ui: &MainWindow, png_state: SharedPngRenderState) {
     let ui_weak = ui.as_weak();
     let callback_browser = browser.clone();
     ui.on_sd_entry_selected(move |index| {
+        println!("[SDCARD] select index={index}");
         if let Some(ui) = ui_weak.upgrade() {
             callback_browser.borrow_mut().select(&ui, index as usize);
         }
@@ -549,6 +558,7 @@ pub(crate) fn install(ui: &MainWindow, png_state: SharedPngRenderState) {
     let ui_weak = ui.as_weak();
     let callback_browser = browser.clone();
     ui.on_sd_up_requested(move || {
+        println!("[SDCARD] up");
         if let Some(ui) = ui_weak.upgrade() {
             callback_browser.borrow_mut().go_up(&ui);
         }
@@ -557,6 +567,7 @@ pub(crate) fn install(ui: &MainWindow, png_state: SharedPngRenderState) {
     let ui_weak = ui.as_weak();
     let callback_browser = browser.clone();
     ui.on_sd_scroll_up(move || {
+        println!("[SDCARD] scroll up");
         if let Some(ui) = ui_weak.upgrade() {
             callback_browser.borrow_mut().scroll(&ui, -(MAX_VISIBLE_ENTRIES as isize));
         }
@@ -565,6 +576,7 @@ pub(crate) fn install(ui: &MainWindow, png_state: SharedPngRenderState) {
     let ui_weak = ui.as_weak();
     let callback_browser = browser.clone();
     ui.on_sd_scroll_down(move || {
+        println!("[SDCARD] scroll down");
         if let Some(ui) = ui_weak.upgrade() {
             callback_browser.borrow_mut().scroll(&ui, MAX_VISIBLE_ENTRIES as isize);
         }
@@ -573,6 +585,7 @@ pub(crate) fn install(ui: &MainWindow, png_state: SharedPngRenderState) {
     let ui_weak = ui.as_weak();
     let callback_browser = browser.clone();
     ui.on_sd_close_text(move || {
+        println!("[SDCARD] close text");
         if let Some(ui) = ui_weak.upgrade() {
             callback_browser.borrow_mut().close_text(&ui);
         }
@@ -581,6 +594,7 @@ pub(crate) fn install(ui: &MainWindow, png_state: SharedPngRenderState) {
     let ui_weak = ui.as_weak();
     let callback_browser = browser.clone();
     ui.on_sd_previous_text_page(move || {
+        println!("[SDCARD] text prev");
         if let Some(ui) = ui_weak.upgrade() {
             callback_browser.borrow_mut().turn_text_page(&ui, -1);
         }
@@ -589,6 +603,7 @@ pub(crate) fn install(ui: &MainWindow, png_state: SharedPngRenderState) {
     let ui_weak = ui.as_weak();
     let callback_browser = browser.clone();
     ui.on_sd_next_text_page(move || {
+        println!("[SDCARD] text next");
         if let Some(ui) = ui_weak.upgrade() {
             callback_browser.borrow_mut().turn_text_page(&ui, 1);
         }
@@ -597,6 +612,7 @@ pub(crate) fn install(ui: &MainWindow, png_state: SharedPngRenderState) {
     let ui_weak = ui.as_weak();
     let callback_browser = browser.clone();
     ui.on_sd_close_image(move || {
+        println!("[SDCARD] close image");
         if let Some(ui) = ui_weak.upgrade() {
             callback_browser.borrow_mut().close_image(&ui);
         }
@@ -605,6 +621,7 @@ pub(crate) fn install(ui: &MainWindow, png_state: SharedPngRenderState) {
     let ui_weak = ui.as_weak();
     let callback_browser = browser.clone();
     ui.on_sd_close_audio(move || {
+        println!("[SDCARD] close audio");
         if let Some(ui) = ui_weak.upgrade() {
             callback_browser.borrow_mut().close_audio(&ui);
         }

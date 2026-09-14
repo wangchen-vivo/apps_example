@@ -45,11 +45,12 @@ export component SdCardPage inherits AppPage {
     // and progress are tracked per-entry so neither view disturbs the other.
     in-out property <bool> audio-open: false;
     in-out property <string> audio-title: "";
-    // File size while idle, then playback progress routed by the audio module.
+    // File size, set once when the WAV is opened.
+    in-out property <string> audio-size: "";
+    // Playback progress text, routed by the audio module while playing.
     in-out property <string> audio-status: "";
     // Playback state of the SD-card WAV source (routed by audio.rs).
     in-out property <bool> audio-playing: false;
-    in property <string> main-audio-status;
     // Shared codec volume, bound to MainWindow's audio-volume by main.slint.
     in-out property <int> audio-volume: 100;
     callback audio-play();
@@ -246,8 +247,8 @@ export component SdCardPage inherits AppPage {
         width: parent.width;
         height: parent.height - 62px - 56px;
         audio-title: root.audio-title;
-        audio-status-size: root.audio-status;
-        audio-status: root.main-audio-status;
+        audio-status-size: root.audio-size;
+        audio-status: root.audio-status;
         audio-playing: root.audio-playing;
         volume <=> root.audio-volume;
         audio-play => { root.audio-play(); }
