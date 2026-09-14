@@ -134,8 +134,14 @@ export component MainWindow inherits Window {
     in-out property <string> audio-status: "点击播放";
     in-out property <bool> audio-playing: false;
     in-out property <int> audio-volume: 100;
+    in-out property <bool> audio-has-sd-audio: false;
+    in-out property <string> audio-track-title: "";
+    in-out property <int> audio-track-index: 0;
+    in-out property <int> audio-track-count: 0;
     callback audio-play();
     callback audio-stop();
+    callback audio-prev();
+    callback audio-next();
     callback set-audio-volume(int);
     callback audio-page-active-changed(bool);
     callback power-off();
@@ -164,8 +170,15 @@ export component MainWindow inherits Window {
         root.audio-page-active-changed(root.current-app == 15);
         root.flash-page-active-changed(root.current-app == 8);
         if root.current-app != 13 {
-            root.sd-image-open = false;
-            root.sd-audio-open = false;
+            if root.sd-image-open {
+                root.sd-close-image();
+            }
+            if root.sd-audio-open {
+                root.sd-close-audio();
+            }
+            if root.sd-text-open {
+                root.sd-close-text();
+            }
         }
     }
 
@@ -295,6 +308,8 @@ export component MainWindow inherits Window {
         audio-volume <=> root.audio-volume;
         audio-play => { root.audio-play(); }
         audio-stop => { root.audio-stop(); }
+        audio-prev => { root.audio-prev(); }
+        audio-next => { root.audio-next(); }
         set-audio-volume(value) => { root.set-audio-volume(value); }
         close-audio => { root.sd-close-audio(); }
         debug(msg) => { root.debug(msg); }
@@ -339,7 +354,16 @@ export component MainWindow inherits Window {
                 root.current-app = -1;
             }
         }
-        go-home => { root.current-app = -1; }
+        go-home => {
+            if root.sd-image-open {
+                root.sd-close-image();
+            } else if root.sd-audio-open {
+                root.sd-close-audio();
+            } else if root.sd-text-open {
+                root.sd-close-text();
+            }
+            root.current-app = -1;
+        }
     }
     if current-app == 14: MetalsPage {
         title: "HTTP GET";
@@ -357,8 +381,14 @@ export component MainWindow inherits Window {
         status-text <=> root.audio-status;
         playing <=> root.audio-playing;
         volume <=> root.audio-volume;
+        has-sd-audio <=> root.audio-has-sd-audio;
+        track-title <=> root.audio-track-title;
+        track-index <=> root.audio-track-index;
+        track-count <=> root.audio-track-count;
         audio-play => { root.audio-play(); }
         audio-stop => { root.audio-stop(); }
+        audio-prev => { root.audio-prev(); }
+        audio-next => { root.audio-next(); }
         set-audio-volume(value) => { root.set-audio-volume(value); }
         swipe-right(dx, dy) => { root.current-app = -1; }
         go-back => { root.current-app = -1; } go-home => { root.current-app = -1; }

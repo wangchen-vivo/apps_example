@@ -168,7 +168,7 @@ fn replace_entry_rows(ui: &MainWindow, rows: Vec<SdFileEntry>) {
     }
 }
 
-fn format_size(size: u64) -> String {
+pub(crate) fn format_size(size: u64) -> String {
     if size >= 1024 * 1024 {
         format!("{:.1} MB", size as f64 / (1024.0 * 1024.0))
     } else if size >= 1024 {
@@ -333,6 +333,7 @@ impl SdBrowser {
     /// audio page's player (audio.rs) via its play_file entry point. The
     /// browser switches to the audio viewer panel while playing.
     fn open_audio_file(&self, ui: &MainWindow, path: &str, name: &str, size: u64) {
+        crate::audio::sync_track_selection(path);
         match crate::audio::play_file(ui, path) {
             Ok(()) => {
                 ui.set_sd_audio_title(name.into());

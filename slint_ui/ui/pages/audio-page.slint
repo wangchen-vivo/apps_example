@@ -6,14 +6,20 @@ import { Theme } from "../components/theme.slint";
 import { Icons } from "../components/icons.slint";
 
 export component AudioPage inherits AppPage {
-    title: "音频播放";
+    title: "音频";
     accent: #6fe0bd;
 
     in-out property <string> status-text: "点击播放";
     in-out property <bool> playing: false;
     in-out property <int> volume: 100;
+    in-out property <bool> has-sd-audio: false;
+    in-out property <string> track-title: "";
+    in-out property <int> track-index: 0;
+    in-out property <int> track-count: 0;
     callback audio-play();
     callback audio-stop();
+    callback audio-prev();
+    callback audio-next();
     callback set-audio-volume(int);
 
     // ===== Hero card: music icon + title + format =====
@@ -34,10 +40,11 @@ export component AudioPage inherits AppPage {
 
         Text {
             x: 92px; y: 16px; width: 200px; height: 36px;
-            text: "音频播放";
+            text: root.has-sd-audio ? root.track-title : "audio";
             color: Theme.primary-text;
-            font-size: Theme.font-lg; font-weight: 800;
+            font-size: Theme.font-base; font-weight: 800;
             vertical-alignment: center;
+            overflow: elide;
         }
 
         Text {
@@ -46,12 +53,33 @@ export component AudioPage inherits AppPage {
             color: Theme.muted-text;
             font-size: Theme.font-sm;
             vertical-alignment: center;
+            overflow: elide;
         }
     }
 
-    // ===== Play / Stop buttons =====
+    // ===== Transport buttons =====
+    // SD-card mode: [上一首][播放][停止][下一首] in one row; built-in mode:
+    // [播放][停止] centred.
+    if root.has-sd-audio: Rectangle {
+        x: 20px; y: 204px; width: 100px; height: 52px;
+        background: Theme.raised-background; border-radius: 10px;
+        border-width: 1px; border-color: Theme.border-color;
+
+        Text {
+            x: 0; y: 0; width: parent.width; height: parent.height;
+            text: "上一首";
+            color: Theme.primary-text; font-size: Theme.font-sm; font-weight: 600;
+            horizontal-alignment: center; vertical-alignment: center;
+        }
+
+        TouchArea {
+            clicked => { root.audio-prev(); }
+        }
+    }
+
     Rectangle {
-        x: parent.width / 2 - 108px; y: 204px; width: 96px; height: 52px;
+        x: root.has-sd-audio ? 130px : parent.width / 2 - 108px;
+        y: 204px; width: 100px; height: 52px;
         background: root.accent; border-radius: 10px;
 
         Text {
@@ -67,7 +95,8 @@ export component AudioPage inherits AppPage {
     }
 
     Rectangle {
-        x: parent.width / 2 + 12px; y: 204px; width: 96px; height: 52px;
+        x: root.has-sd-audio ? 240px : parent.width / 2 + 12px;
+        y: 204px; width: 100px; height: 52px;
         background: #ff6b6b; border-radius: 10px;
 
         Text {
@@ -79,6 +108,23 @@ export component AudioPage inherits AppPage {
 
         TouchArea {
             clicked => { root.audio-stop(); }
+        }
+    }
+
+    if root.has-sd-audio: Rectangle {
+        x: 350px; y: 204px; width: 110px; height: 52px;
+        background: Theme.raised-background; border-radius: 10px;
+        border-width: 1px; border-color: Theme.border-color;
+
+        Text {
+            x: 0; y: 0; width: parent.width; height: parent.height;
+            text: "下一首";
+            color: Theme.primary-text; font-size: Theme.font-sm; font-weight: 600;
+            horizontal-alignment: center; vertical-alignment: center;
+        }
+
+        TouchArea {
+            clicked => { root.audio-next(); }
         }
     }
 

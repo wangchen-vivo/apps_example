@@ -31,6 +31,71 @@ use std::rc::Rc;
 /// audio_example app (output.wav).
 include!("audio_pcm_short.rs");
 
+/// Root directory scanned for WAV tracks on the SD card. Scanned recursively;
+/// empty when the card is absent or holds no WAV files.
+const SD_SOUNDS_ROOT: &str = "/data/Sounds";
+
+thread_local! {
+    /// WAV track paths found under SD_SOUNDS_ROOT, in path order. Empty when
+    /// the SD card has no playable tracks (built-in PCM mode).
+    static SD_TRACKS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    /// Index of the currently selected track in SD_TRACKS.
+    static SD_TRACK_INDEX: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Collect every .wav file under `dir` (recursively) into `out`.
+fn collect_wavs(dir: &std::path::Path, out: &mut Vec<String>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_wavs(&path, out);
+        } else if path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("wav"))
+        {
+            out.push(path.to_string_lossy().into_owned());
+        }
+    }
+}
+
+/// (Re)scan the SD card for WAV tracks under SD_SOUNDS_ROOT and update the
+/// track list. Returns true when at least one track was found.
+fn scan_sd_tracks() -> bool {
+    let mut tracks = Vec::new();
+    collect_wavs(std::path::Path::new(SD_SOUNDS_ROOT), &mut tracks);
+    tracks.sort();
+    SD_TRACKS.with(|slot| {
+        let mut current = slot.borrow_mut();
+        *current = tracks.clone();
+    });
+    SD_TRACK_INDEX.with(|slot| {
+        if tracks.is_empty() {
+            slot.set(0);
+        } else if slot.get() >= tracks.len() {
+            slot.set(0);
+        }
+    });
+    !tracks.is_empty()
+}
+
+/// File name of the track at the current index, or empty when in built-in mode.
+fn current_track_name() -> String {
+    SD_TRACKS.with(|tracks| {
+        SD_TRACK_INDEX.with(|index| {
+            let tracks = tracks.borrow();
+            tracks
+                .get(index.get())
+                .and_then(|path| std::path::Path::new(path).file_name())
+                .and_then(|name| name.to_str())
+                .map(str::to_owned)
+                .unwrap_or_default()
+        })
+    })
+}
+
 /// Where the played PCM comes from. The audio page plays the built-in PCM;
 /// the SD card browser starts playback from a WAV file on the card.
 pub(crate) enum AudioSource {
@@ -49,7 +114,7 @@ impl AudioSource {
 
     fn label(&self) -> String {
         match self {
-            AudioSource::Builtin => "内置 TTS".to_string(),
+            AudioSource::Builtin => "builtin TTS".to_string(),
             AudioSource::File { path, .. } => path.clone(),
         }
     }
@@ -235,15 +300,30 @@ fn playback_tick(ui: &MainWindow) {
             let pcm = EXAMPLE_PCM.as_slice();
             pcm[player.offset..player.offset + raw_len].to_vec()
         } else if let Some(wav) = player.wav_file.as_mut() {
+            // Read up to raw_len bytes. The WAV header may declare a data
+            // size larger than the real file (e.g. padding), so accept a
+            // short read: reaching EOF ends playback instead of erroring.
             let mut chunk = vec![0u8; raw_len];
-            if let Err(e) = wav.read_exact(&mut chunk) {
-                println!("[AUDIO] WAV read error at {}: {}", player.offset, e);
-                set_status(ui, &player.source, format!("读取 WAV 失败: {}", e));
+            let n = match wav.read(&mut chunk) {
+                Ok(n) => n,
+                Err(e) => {
+                    println!("[AUDIO] WAV read error at {}: {}", player.offset, e);
+                    set_status(ui, &player.source, format!("读取 WAV 失败: {}", e));
+                    set_playing(ui, &player.source, false);
+                    drop(player.file.take());
+                    drop(player.wav_file.take());
+                    return;
+                }
+            };
+            if n == 0 {
+                println!("[AUDIO] playback done ({} bytes)", player.offset);
+                set_status(ui, &player.source, "播放完成".to_string());
                 set_playing(ui, &player.source, false);
                 drop(player.file.take());
                 drop(player.wav_file.take());
                 return;
             }
+            chunk.truncate(n);
             chunk
         } else {
             set_status(ui, &player.source, "WAV 文件未打开".to_string());
@@ -251,6 +331,8 @@ fn playback_tick(ui: &MainWindow) {
             drop(player.file.take());
             return;
         };
+        let raw_len = pcm_chunk.len();
+        let lj_len = (raw_len / 2) * 16;
         convert_to_lj(&pcm_chunk, &mut player.buf, 0, raw_len);
 
         // Split borrows: take file out, write, then put back.
@@ -280,19 +362,33 @@ fn playback_tick(ui: &MainWindow) {
 }
 
 /// Route a playback status update to the UI that owns the current source:
-/// the audio page for the built-in PCM, the SD card viewer for WAV files.
+/// the audio page for the built-in PCM and for WAV tracks started from the
+/// audio page, the SD card viewer for WAV files opened there.
 fn set_status(ui: &MainWindow, source: &AudioSource, text: String) {
     match source {
         AudioSource::Builtin => ui.set_audio_status(text.into()),
+        AudioSource::File { .. } if ui.get_current_app() == 15 => {
+            ui.set_audio_status(text.into())
+        }
         AudioSource::File { .. } => ui.set_sd_audio_status(text.into()),
     }
 }
 
-/// Route the playing flag to the UI that owns the current source.
+/// Route the playing flag to the UI that owns the current source. Stopping
+/// always clears both UI flags: the page that started playback may have been
+/// left by the time playback completes, and the timer gate checks either.
 fn set_playing(ui: &MainWindow, source: &AudioSource, playing: bool) {
+    if !playing {
+        ui.set_audio_playing(false);
+        ui.set_sd_audio_playing(false);
+        return;
+    }
     match source {
-        AudioSource::Builtin => ui.set_audio_playing(playing),
-        AudioSource::File { .. } => ui.set_sd_audio_playing(playing),
+        AudioSource::Builtin => ui.set_audio_playing(true),
+        AudioSource::File { .. } if ui.get_current_app() == 15 => {
+            ui.set_audio_playing(true)
+        }
+        AudioSource::File { .. } => ui.set_sd_audio_playing(true),
     }
 }
 
@@ -512,6 +608,17 @@ pub(crate) fn install(ui: &MainWindow) -> slint::Timer {
                 let value = active_controller.borrow().get();
                 ui.set_audio_volume(value as i32);
             }
+            // Scan the SD card for WAV tracks and pick the playback mode.
+            // Without any WAV the page stays in built-in PCM mode.
+            let has_tracks = scan_sd_tracks();
+            let count = SD_TRACKS.with(|t| t.borrow().len()) as i32;
+            let title = if has_tracks { current_track_name() } else { String::new() };
+            if let Some(ui) = vol_active_weak.upgrade() {
+                ui.set_audio_has_sd_audio(has_tracks);
+                ui.set_audio_track_count(count);
+                ui.set_audio_track_title(title.into());
+                ui.set_audio_track_index(if has_tracks { 0 } else { 0 });
+            }
         } else {
             // Leaving the audio page stops playback, matching the SD-card
             // audio viewer's close behavior.
@@ -529,6 +636,82 @@ pub(crate) fn install(ui: &MainWindow) -> slint::Timer {
     let unmute_timer = Rc::new(unmute_timer);
     let unmute_timer_play = unmute_timer.clone();
 
+    // Play the track at the given index in the SD list; falls back to the
+    // built-in PCM when the index is out of range. Returns true when a WAV
+    // was started.
+    fn play_track_at(ui: &MainWindow, index: usize) -> bool {
+        let path = SD_TRACKS.with(|tracks| tracks.borrow().get(index).cloned());
+        let Some(path) = path else {
+            return false;
+        };
+        match play_file(ui, &path) {
+            Ok(()) => {
+                let name = std::path::Path::new(&path)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or(&path)
+                    .to_owned();
+                if ui.get_current_app() == 15 {
+                    ui.set_audio_track_title(name.into());
+                    ui.set_audio_track_index(index as i32);
+                    ui.set_audio_track_count(SD_TRACKS.with(|t| t.borrow().len()) as i32);
+                } else {
+                    ui.set_sd_audio_title(name.into());
+                    let size = std::fs::metadata(&path)
+                        .map(|m| crate::sdcard::format_size(m.len()))
+                        .unwrap_or_default();
+                    ui.set_sd_audio_size(size.into());
+                    ui.set_sd_audio_open(true);
+                }
+                true
+            }
+            Err(error) => {
+                println!("[AUDIO] track {index} failed: {error}");
+                false
+            }
+        }
+    }
+
+    let prev_ui_weak = ui.as_weak();
+    ui.on_audio_prev(move || {
+        let ui = match prev_ui_weak.upgrade() {
+            Some(ui) => ui,
+            None => return,
+        };
+        ui.invoke_audio_stop();
+        let total = SD_TRACKS.with(|t| t.borrow().len());
+        if total == 0 {
+            return;
+        }
+        let next = SD_TRACK_INDEX.with(|slot| {
+            let current = slot.get();
+            let next = if current == 0 { total - 1 } else { current - 1 };
+            slot.set(next);
+            next
+        });
+        play_track_at(&ui, next);
+    });
+
+    let next_ui_weak = ui.as_weak();
+    ui.on_audio_next(move || {
+        let ui = match next_ui_weak.upgrade() {
+            Some(ui) => ui,
+            None => return,
+        };
+        ui.invoke_audio_stop();
+        let total = SD_TRACKS.with(|t| t.borrow().len());
+        if total == 0 {
+            return;
+        }
+        let next = SD_TRACK_INDEX.with(|slot| {
+            let current = slot.get();
+            let next = (current + 1) % total;
+            slot.set(next);
+            next
+        });
+        play_track_at(&ui, next);
+    });
+
     ui.on_audio_play(move || {
         let ui = match ui_weak.upgrade() {
             Some(ui) => ui,
@@ -536,6 +719,13 @@ pub(crate) fn install(ui: &MainWindow) -> slint::Timer {
         };
 
         if ui.get_audio_playing() {
+            return;
+        }
+
+        // SD-card mode: play the currently selected WAV track.
+        if !SD_TRACKS.with(|t| t.borrow().is_empty()) {
+            let index = SD_TRACK_INDEX.with(|slot| slot.get());
+            play_track_at(&ui, index);
             return;
         }
 
@@ -623,7 +813,6 @@ pub(crate) fn install(ui: &MainWindow) -> slint::Timer {
                             controller.borrow().set(pct);
                         }
                     });
-                    ui.set_audio_status(format!("音量 {}%", pct).into());
                 }
             }
 
@@ -692,6 +881,24 @@ fn skip_wav_to_data(file: &mut std::fs::File) -> IoResult<()> {
             return Err(Error::new(ErrorKind::UnexpectedEof, "truncated WAV chunk"));
         }
     }
+}
+
+/// Synchronize the SD track selection with `path` so prev/next navigation
+/// from the SD card viewer starts from the just-opened WAV. Re-scans the
+/// /data/Sounds tree when the list is stale (e.g. first open this boot).
+pub(crate) fn sync_track_selection(path: &str) {
+    let exists = SD_TRACKS.with(|t| !t.borrow().is_empty());
+    if !exists {
+        scan_sd_tracks();
+    }
+    SD_TRACKS.with(|tracks| {
+        let tracks = tracks.borrow();
+        if let Some(index) = tracks.iter().position(|p| p == path) {
+            SD_TRACK_INDEX.with(|slot| slot.set(index));
+        } else {
+            println!("[AUDIO] wav not in SD_TRACKS: {path}");
+        }
+    });
 }
 
 /// Entry point for the SD card browser: play a WAV file from the card.

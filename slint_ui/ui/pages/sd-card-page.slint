@@ -55,6 +55,8 @@ export component SdCardPage inherits AppPage {
     in-out property <int> audio-volume: 100;
     callback audio-play();
     callback audio-stop();
+    callback audio-prev();
+    callback audio-next();
     callback set-audio-volume(int);
     // Currently pressed row index (-1 = none). Highlighted with an accent border.
     property <int> pressed-index: -1;
@@ -253,6 +255,8 @@ export component SdCardPage inherits AppPage {
         volume <=> root.audio-volume;
         audio-play => { root.audio-play(); }
         audio-stop => { root.audio-stop(); }
+        audio-prev => { root.audio-prev(); }
+        audio-next => { root.audio-next(); }
         set-audio-volume(value) => { root.set-audio-volume(value); }
     }
 }
