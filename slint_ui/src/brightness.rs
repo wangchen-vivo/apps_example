@@ -101,13 +101,20 @@ impl BrightnessController {
             return;
         }
         let hw_value = ((pct as u16 * 255 + 50) / 100) as u8;
-        println!("[BACKLIGHT] set {} ({}%)", hw_value, pct);
         if let Err(error) = self.fd.write_brightness(hw_value) {
             println!("[BACKLIGHT] set failed: {error}");
             self.last_set.set(None);
         } else {
             self.last_set.set(Some(pct));
         }
+    }
+
+    // Log the final brightness after a drag or button press ends. Called once
+    // per interaction rather than on every intermediate value during dragging.
+    fn commit(&self, value: u8) {
+        let pct = value.max(Self::MIN_PCT);
+        let hw_value = ((pct as u16 * 255 + 50) / 100) as u8;
+        println!("[BACKLIGHT] set {} ({}%)", hw_value, pct);
     }
 
     fn get(&self) -> u8 {
@@ -150,6 +157,14 @@ pub(crate) fn install(ui: &MainWindow) {
     ui.on_set_brightness(move |value| {
         if let Some(_ui) = ui_weak.upgrade() {
             callback_controller.borrow().set(value as u8);
+        }
+    });
+
+    let ui_weak = ui.as_weak();
+    let commit_controller = controller.clone();
+    ui.on_commit_brightness(move |value| {
+        if let Some(_ui) = ui_weak.upgrade() {
+            commit_controller.borrow().commit(value as u8);
         }
     });
 

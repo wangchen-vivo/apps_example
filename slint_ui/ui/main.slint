@@ -71,6 +71,7 @@ export component MainWindow inherits Window {
 
     in-out property <int> brightness: 100;
     callback set-brightness(int);
+    callback commit-brightness(int);
     callback brightness-page-active-changed(bool);
 
     // SchedMon page properties
@@ -217,9 +218,10 @@ export component MainWindow inherits Window {
     if current-app == 10: BrightnessPage {
         brightness <=> root.brightness;
         set-brightness(value) => { root.set-brightness(value); }
+        commit-brightness(value) => { root.commit-brightness(value); }
         swipe-right(dx, dy) => { root.current-app = -1; }
-        swipe-up(dx, dy) => { root.brightness = min(root.brightness + 10, 100); root.set-brightness(root.brightness); }
-        swipe-down(dx, dy) => { root.brightness = max(root.brightness - 10, 30); root.set-brightness(root.brightness); }
+        swipe-up(dx, dy) => { root.brightness = min(root.brightness + 10, 100); root.set-brightness(root.brightness); root.commit-brightness(root.brightness); }
+        swipe-down(dx, dy) => { root.brightness = max(root.brightness - 10, 30); root.set-brightness(root.brightness); root.commit-brightness(root.brightness); }
         go-back => { root.current-app = -1; } go-home => { root.current-app = -1; }
     }
     // 外设 demo pages
