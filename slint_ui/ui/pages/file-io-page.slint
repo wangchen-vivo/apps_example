@@ -16,8 +16,8 @@ export component FileIoPage inherits AppPage {
     in-out property <string> status-text: "点按 START 写入并校验 Flash";
     callback start-requested();
 
-    property <int> total-bytes: 128;
-    property <float> progress: root.bytes-written / root.total-bytes;
+    in-out property <int> total-bytes: 0;
+    property <float> progress: root.total-bytes > 0 ? root.bytes-written / root.total-bytes : 0.0;
 
     Rectangle {
         x: 16px; y: 76px; width: 448px; height: 92px;

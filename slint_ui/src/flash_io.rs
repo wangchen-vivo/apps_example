@@ -28,7 +28,7 @@ const SECTOR_SIZE: usize = 4096;
 const SLOT_COUNT: usize = 2048;
 const HEADER_SIZE: usize = 32;
 const PAYLOAD_SIZE: usize = SECTOR_SIZE - HEADER_SIZE;
-const RECORDS_PER_RUN: usize = 32;
+const RECORDS_PER_RUN: usize = 128;
 const MAGIC: u32 = 0x4246_494f;
 const FORMAT_VERSION: u32 = 1;
 const COMMIT_MARKER: u32 = 0x434f_4d4d;
@@ -179,7 +179,7 @@ impl FlashJournal {
             .map(|(_, sequence)| sequence.wrapping_add(1).max(1))
             .unwrap_or(1);
         println!(
-            "[FLASH_IO] scan complete used_slots={} next_slot={} next_sequence={}",
+            "[FLASH] scan complete used_slots={} next_slot={} next_sequence={}",
             used.iter().filter(|is_used| **is_used).count(),
             next_slot,
             next_sequence
@@ -197,7 +197,7 @@ impl FlashJournal {
         let started_at = uptime_micros();
         let base = slot * SECTOR_SIZE;
         println!(
-            "[FLASH_IO] begin slot={} sequence={} offset=0x{:08x} previously_used={}",
+            "[FLASH] begin slot={} sequence={} offset=0x{:08x} previously_used={}",
             slot, sequence, base, self.used[slot]
         );
 
@@ -207,7 +207,6 @@ impl FlashJournal {
                 format!("erase failed: slot={slot} offset=0x{base:08x}: {error}"),
             )
         })?;
-
         let mut erased = vec![0u8; SECTOR_SIZE];
         device.read_exact_at(base, &mut erased).map_err(|error| {
             Error::new(
@@ -229,7 +228,7 @@ impl FlashJournal {
                 ),
             ));
         }
-        println!("[FLASH_IO] erase verified slot={slot}");
+        println!("[FLASH] erase verified slot={slot}");
 
         let mut payload = vec![0u8; PAYLOAD_SIZE];
         fill_payload(&mut payload, sequence);
@@ -257,7 +256,6 @@ impl FlashJournal {
                     format!("payload write failed: slot={slot}: {error}"),
                 )
             })?;
-
         let mut verify = vec![0u8; PAYLOAD_SIZE];
         device
             .read_exact_at(base + HEADER_SIZE, &mut verify)
@@ -306,7 +304,7 @@ impl FlashJournal {
         }
 
         println!(
-            "[FLASH_IO] verified slot={} sequence={} crc=0x{:08x} elapsed_us={}",
+            "[FLASH] verified slot={} sequence={} crc=0x{:08x} elapsed_us={}",
             slot,
             sequence,
             crc,
@@ -344,7 +342,7 @@ fn run_write_thread() {
     let device = match FlashDevice::open() {
         Ok(device) => device,
         Err(error) => {
-            println!("[FLASH_IO] open failed: {error}");
+            println!("[FLASH] open failed: {error}");
             RUN_FAILED.store(true, Ordering::Relaxed);
             RUN_ACTIVE.store(false, Ordering::Relaxed);
             return;
@@ -353,13 +351,19 @@ fn run_write_thread() {
     let mut journal = match FlashJournal::scan(&device) {
         Ok(journal) => journal,
         Err(error) => {
-            println!("[FLASH_IO] scan failed: {error}");
+            println!("[FLASH] scan failed: {error}");
             RUN_FAILED.store(true, Ordering::Relaxed);
             RUN_ACTIVE.store(false, Ordering::Relaxed);
             return;
         }
     };
 
+    // Live-speed sliding window: the realtime figure is the wall span across
+    // the last WINDOW records (so scheduling gaps count and the value settles
+    // to a steady number instead of ramping up from the run's average).
+    const SPEED_WINDOW: usize = 4;
+    let mut window_micros = [0u128; SPEED_WINDOW];
+    let mut window_idx = 0usize;
     for _ in 0..RECORDS_PER_RUN {
         if !RUN_ACTIVE.load(Ordering::Relaxed) {
             // A new run replaced this one; stop quietly.
@@ -375,12 +379,22 @@ fn run_write_thread() {
                 // includes every scheduling gap, so the average is honest.
                 let wall = uptime_micros().saturating_sub(run_start);
                 RUN_WALL_MICROS.store(wall as u64, Ordering::Relaxed);
+                window_micros[window_idx % SPEED_WINDOW] = wall;
+                window_idx += 1;
+                // Average speed: total bytes over total wall time.
                 let done = done as usize;
-                SPEED_KBPS.store(throughput_kib(wall, done), Ordering::Relaxed);
                 AVERAGE_KBPS.store(throughput_kib(wall, done), Ordering::Relaxed);
+                // Live speed: bytes across the sliding window once it is full.
+                if window_idx >= SPEED_WINDOW {
+                    let oldest = window_micros[window_idx % SPEED_WINDOW];
+                    let span = wall.saturating_sub(oldest);
+                    SPEED_KBPS.store(throughput_kib(span, SPEED_WINDOW), Ordering::Relaxed);
+                } else {
+                    SPEED_KBPS.store(throughput_kib(wall, window_idx), Ordering::Relaxed);
+                }
             }
             Err(error) => {
-                println!("[FLASH_IO] failed: {error}");
+                println!("[FLASH] failed: {error}");
                 RUN_FAILED.store(true, Ordering::Relaxed);
                 RUN_ACTIVE.store(false, Ordering::Relaxed);
                 return;
@@ -455,30 +469,6 @@ fn abort_writer_thread() {
     join_writer_thread();
 }
 
-// ---------------------------------------------------------------------------
-// Diagnostic heap snapshot (temporary, for the double-START panic probe):
-// reads /proc/meminfo and prints total/used/largest-free. The interesting
-// field is MemLargestFree — pthread_create needs a contiguous 24 KiB block;
-// an allocation failure there panics inside librs (assert on NULL).
-// ---------------------------------------------------------------------------
-fn log_heap(tag: &str) {
-    use std::io::Read;
-    let Ok(mut file) = std::fs::File::open("/proc/meminfo") else {
-        println!("[FLASH_IO-HM] {tag}: /proc/meminfo unavailable");
-        return;
-    };
-    let mut buf = std::string::String::new();
-    if file.read_to_string(&mut buf).is_err() {
-        println!("[FLASH_IO-HM] {tag}: read failed");
-        return;
-    }
-    // Forward the kernel's own lines, tagged with the probe point.
-    for line in buf.lines() {
-        println!("[FLASH_IO-HM] {tag} {}", line.trim());
-    }
-}
-
-
 pub(crate) fn install(ui: &MainWindow) -> slint::Timer {
     let ui_weak = ui.as_weak();
     ui.on_flash_start_requested(move || {
@@ -490,9 +480,11 @@ pub(crate) fn install(ui: &MainWindow) -> slint::Timer {
         if RUN_ACTIVE.load(Ordering::Relaxed) {
             return;
         }
+        println!("[FLASH] start");
         RUN_ACTIVE.store(true, Ordering::Relaxed);
         RUN_END_HANDLED.store(false, Ordering::Relaxed);
-        log_heap("pre-spawn");        ui.set_flash_bytes_written(0);
+        ui.set_flash_bytes_written(0);
+        ui.set_flash_total_bytes((RECORDS_PER_RUN * (SECTOR_SIZE / 1024)) as i32);
         ui.set_flash_speed_kbps(0);
         ui.set_flash_average_kbps(0);
         ui.set_flash_running(true);
@@ -505,8 +497,7 @@ pub(crate) fn install(ui: &MainWindow) -> slint::Timer {
                 WRITER_THREAD.with(|slot| *slot.borrow_mut() = Some(handle));
             }
             Err(error) => {
-                log_heap("spawn-fail");
-                println!("[FLASH_IO] thread spawn failed: {error}");
+                println!("[FLASH] thread spawn failed: {error}");
                 RUN_ACTIVE.store(false, Ordering::Relaxed);
                 ui.set_flash_running(false);
                 ui.set_flash_status_text(format!("线程启动失败: {error}").into());
@@ -519,7 +510,13 @@ pub(crate) fn install(ui: &MainWindow) -> slint::Timer {
     // by one record's flash time). Re-entering shows the aborted state and
     // START becomes available again.
     let ui_weak2 = ui.as_weak();
+    let page_active = std::rc::Rc::new(std::cell::Cell::new(false));
+    let active_state = page_active.clone();
     ui.on_flash_page_active_changed(move |active| {
+        if active_state.replace(active) == active {
+            return;
+        }
+        println!("[PAGE] {} flash", if active { "enter" } else { "exit" });
         if !active {
             abort_writer_thread();
             if let Some(ui) = ui_weak2.upgrade() {
@@ -531,12 +528,14 @@ pub(crate) fn install(ui: &MainWindow) -> slint::Timer {
 
     // UI-side poller: mirrors the writer thread's atomics into the Slint
     // properties. MainWindow is !Send, so all UI mutations stay on this
-    // (event-loop) thread; the 30ms cadence only affects display latency.
+    // (event-loop) thread. The 500ms cadence keeps the flash bus free for
+    // the writer thread: a faster UI refresh steals flash bandwidth and
+    // drags the measured write speed down (single core, XIP from flash).
     let timer = slint::Timer::default();
     let ui_weak = ui.as_weak();
     timer.start(
         slint::TimerMode::Repeated,
-        std::time::Duration::from_millis(30),
+        std::time::Duration::from_millis(500),
         move || {
             let Some(ui) = ui_weak.upgrade() else {
                 return;
@@ -558,7 +557,6 @@ pub(crate) fn install(ui: &MainWindow) -> slint::Timer {
             // the next start.
             ui.set_flash_running(false);
             join_writer_thread();
-            log_heap("post-join");
             if RUN_FAILED.load(Ordering::Relaxed) {
                 ui.set_flash_status_text("Flash 错误，见串口日志".into());
             } else {

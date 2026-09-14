@@ -54,6 +54,7 @@ export component MainWindow inherits Window {
 
     in-out property <bool> flash-running: false;
     in-out property <int> flash-bytes-written: 0;
+    in-out property <int> flash-total-bytes: 0;
     in-out property <int> flash-speed-kbps: 0;
     in-out property <int> flash-average-kbps: 0;
     in-out property <int> flash-slot: 0;
@@ -214,6 +215,7 @@ export component MainWindow inherits Window {
     if current-app == 8: FileIoPage {
         running <=> root.flash-running;
         bytes-written <=> root.flash-bytes-written;
+        total-bytes <=> root.flash-total-bytes;
         speed-kbps <=> root.flash-speed-kbps;
         average-kbps <=> root.flash-average-kbps;
         slot <=> root.flash-slot;
