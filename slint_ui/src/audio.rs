@@ -512,6 +512,12 @@ pub(crate) fn install(ui: &MainWindow) -> slint::Timer {
                 let value = active_controller.borrow().get();
                 ui.set_audio_volume(value as i32);
             }
+        } else {
+            // Leaving the audio page stops playback, matching the SD-card
+            // audio viewer's close behavior.
+            if let Some(ui) = vol_active_weak.upgrade() {
+                ui.invoke_audio_stop();
+            }
         }
     });
 
