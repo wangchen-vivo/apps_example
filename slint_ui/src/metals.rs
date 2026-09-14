@@ -17,16 +17,21 @@
 // metals) + bilibili unix-timestamp time sync, displayed via a locally-derived
 // wall clock so the per-second tick costs zero network requests.
 //
-// A slint::Timer drives the state machine on the UI thread. HTTP requests are
-// blocking, bounded by SO_RCVTIMEO, and only run while this page is active.
+// A slint::Timer drives the WiFi state machine on the UI thread. The HTTP
+// fetch is blocking (bounded by SO_RCVTIMEO) and runs on a worker thread so
+// a dead network never stalls the UI; the event loop polls the result
+// atomics on the per-second tick.
 
 use crate::app_window::MainWindow;
 use crate::{syscall_error, uptime_millis};
 use librs::syscall::Syscall;
 use slint::ComponentHandle;
-use std::cell::RefCell;
-use std::io::{Error, ErrorKind, Result as IoResult};
-use std::rc::Rc;
+use std::{
+    cell::RefCell,
+    io::{Error, ErrorKind, Result as IoResult},
+    rc::Rc,
+    sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering},
+};
 
 // Board reaches the public APIs through a plain-HTTP reverse proxy on the host
 // (kernel has TCP but no DNS/TLS).
@@ -38,12 +43,44 @@ const HTTP_PATH: &str = "/q=hf_XAU,hf_XAG";
 const TICK_MS: u64 = 1000; // per-second wall-clock tick
 const REFRESH_MS: u128 = 60 * 1000; // price refresh cadence
 const FIRST_FETCH_DELAY_MS: u128 = 1500; // let the network settle after boot
+/// Orphan-recycle window. A normal fetch lands in ~3 s; the SO_RCVTIMEO
+/// bounds the read side at 10 s. Only a dead network (SYN retry loop)
+/// can exceed this, and then the UI tick stops waiting on that worker,
+/// releases FETCH_PENDING so a fresh fetch can start, and the stale
+/// worker's late result is discarded via the generation check.
+const FETCH_TIMEOUT_MS: u128 = 20 * 1000;
 
 const MAX_BODY: usize = 4 * 1024;
 // 8 KiB reserve was OOMing the kernel heap (8704-byte alloc) after Wi-Fi
 // init; the proxy's header is ~300 bytes so 1 KiB is ample.
 const MAX_HEAD: usize = 1 * 1024;
 const READ_CHUNK: usize = 512;
+
+// ---------------------------------------------------------------------------
+// Fetch result channel: worker thread (producer) -> UI tick (consumer).
+// MainWindow is !Send, so the blocking HTTP fetch runs off-thread and the
+// event loop only ever reads these atomics. Prices are i32 in 0.01 units
+// (e.g. 73456 = 734.56); FRESH marks fields that this fetch has updated.
+// ---------------------------------------------------------------------------
+static RESULT_READY: AtomicBool = AtomicBool::new(false);
+static RESULT_OK: AtomicBool = AtomicBool::new(false);
+static RESULT_HTTP_CODE: AtomicI32 = AtomicI32::new(0);
+static RESULT_SERVER_TS: AtomicU64 = AtomicU64::new(0);
+static RESULT_XAU: AtomicI32 = AtomicI32::new(0);
+static RESULT_XAG: AtomicI32 = AtomicI32::new(0);
+// Generation tag: bumped when a fetch is launched. A worker publishes its
+// generation with the result; the UI tick only applies results whose
+// generation matches the current one, so a stale orphan worker (past its
+// recycle window) can never overwrite fresher data.
+static FETCH_GENERATION: AtomicU32 = AtomicU32::new(0);
+static RESULT_GENERATION: AtomicU32 = AtomicU32::new(0);
+static CLOCK_SERVER_TS: AtomicU64 = AtomicU64::new(0);
+static CLOCK_MONO_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Fetch in-flight flag shared by the UI tick (setter) and worker (clearer).
+static FETCH_PENDING: AtomicBool = AtomicBool::new(false);
+/// Spawn moment of the in-flight fetch (uptime millis); drives recycle.
+static FETCH_STARTED_MS: AtomicU64 = AtomicU64::new(0);
 
 // ---------------------------------------------------------------------------
 // Wall clock: network-synced unix seconds + local monotonic derivation.
@@ -286,6 +323,23 @@ fn extract_tencent_price(body: &[u8], key: &str) -> Option<std::string::String> 
     Some(raw.to_string())
 }
 
+/// Parse a decimal price string into hundredths as i32 ("734.56" -> 73456).
+/// Cross-atomics cannot carry strings (no atomic String), so the worker
+/// converts to a fixed-point integer before publishing.
+fn parse_price(raw: &str) -> Option<i32> {
+    let (whole, frac) = match raw.split_once('.') {
+        Some((w, f)) => (w, f),
+        None => (raw, ""),
+    };
+    let whole: i32 = whole.parse().ok()?;
+    let cents = match frac {
+        "" => 0,
+        f if f.len() == 1 => f.parse::<i32>().ok()? * 10,
+        f => f.get(..2)?.parse::<i32>().ok()?,
+    };
+    whole.checked_mul(100)?.checked_add(cents)
+}
+
 /// Parse an RFC 1123 `Date` header (e.g. "date: Thu, 10 Sep 2026 07:21:36 GMT")
 /// into unix seconds. Used to derive Beijing time from the price response so
 /// the demo needs only one HTTP request.
@@ -500,38 +554,104 @@ impl MetalsFetcher {
 
     /// One Tencent request updates both prices and resyncs the wall clock
     /// from the response `Date` header, so the demo needs a single request.
-    fn fetch_prices(&mut self, ui: &MainWindow) {
-        match http_get(HTTP_PROXY_IP, HTTP_PROXY_PORT, HTTP_PATH, HTTP_HOST) {
-            Ok((200, head, body)) => {
-                println!("HTTP RESPONSE 200");
-                if let Some(ts) = parse_date_header(&head) {
+    /// Runs on a worker thread: the blocking socket calls here must never
+    /// stall the UI event loop. Results go through the atomics above.
+    fn fetch_prices(&mut self, _ui: &MainWindow) {
+        let generation = FETCH_GENERATION.load(Ordering::Relaxed);
+        let _ = std::thread::Builder::new()
+            .stack_size(FETCH_THREAD_STACK_SIZE)
+            .spawn(move || {
+                match http_get(HTTP_PROXY_IP, HTTP_PROXY_PORT, HTTP_PATH, HTTP_HOST) {
+                    Ok((200, head, body)) => {
+                        println!("HTTP RESPONSE 200");
+                        RESULT_HTTP_CODE.store(200, Ordering::Relaxed);
+                        if let Some(ts) = parse_date_header(&head) {
+                            RESULT_SERVER_TS.store(ts, Ordering::Relaxed);
+                        }
+                        if let Some(gold) = extract_tencent_price(&body, "hf_XAU") {
+                            if let Some(v) = parse_price(&gold) {
+                                RESULT_XAU.store(v, Ordering::Relaxed);
+                            }
+                        }
+                        if let Some(silver) = extract_tencent_price(&body, "hf_XAG") {
+                            if let Some(v) = parse_price(&silver) {
+                                RESULT_XAG.store(v, Ordering::Relaxed);
+                            }
+                        }
+                        RESULT_OK.store(true, Ordering::Relaxed);
+                    }
+                    Ok((code, _, _)) => {
+                        println!("HTTP RESPONSE {}", code);
+                        RESULT_HTTP_CODE.store(code as i32, Ordering::Relaxed);
+                        RESULT_OK.store(false, Ordering::Relaxed);
+                    }
+                    Err(err) => {
+                        println!("HTTP ERR kind={:?} raw={:?}", err.kind(), err.raw_os_error());
+                        RESULT_HTTP_CODE.store(0, Ordering::Relaxed);
+                        RESULT_OK.store(false, Ordering::Relaxed);
+                    }
+                }
+                RESULT_GENERATION.store(generation, Ordering::Relaxed);
+                RESULT_READY.store(true, Ordering::Relaxed);
+                FETCH_PENDING.store(false, Ordering::Relaxed);
+            });
+    }
+
+    fn tick(&mut self, ui: &MainWindow) {
+        let now = uptime_millis();
+
+        // Drain a completed fetch: apply prices + clock sync to the UI. All
+        // mutations stay on this (event-loop) thread; the worker only wrote
+        // the atomics. A stale orphan's result carries an old generation and
+        // is dropped here instead of overwriting fresher data.
+        if RESULT_READY.swap(false, Ordering::Relaxed) {
+            FETCH_PENDING.store(false, Ordering::Relaxed);
+            ui.set_metals_refreshing(false);
+            self.refreshing = false;
+            let generation = RESULT_GENERATION.load(Ordering::Relaxed);
+            if generation != FETCH_GENERATION.load(Ordering::Relaxed) {
+                println!("[METALS] dropped stale fetch result (gen {generation})");
+            } else if RESULT_OK.load(Ordering::Relaxed) {
+                let ts = RESULT_SERVER_TS.load(Ordering::Relaxed);
+                if ts != 0 {
                     self.clock.sync(ts);
                     if let Some(hm) = self.clock.now_hhmm() {
                         ui.set_metals_time(hm.clone().into());
                         self.last_minute = Some(hm);
                     }
                 }
-                if let Some(gold) = extract_tencent_price(&body, "hf_XAU") {
+                if let Some(gold) = format_fixed_price(RESULT_XAU.load(Ordering::Relaxed)) {
                     ui.set_metals_xau(gold.into());
                 }
-                if let Some(silver) = extract_tencent_price(&body, "hf_XAG") {
+                if let Some(silver) = format_fixed_price(RESULT_XAG.load(Ordering::Relaxed)) {
                     ui.set_metals_xag(silver.into());
                 }
                 ui.set_metals_status("".into());
-            }
-            Ok((code, _, _)) => {
-                println!("HTTP RESPONSE {}", code);
-                ui.set_metals_status(format!("HTTP 状态 {}", code).into());
-            }
-            Err(err) => {
-                println!("HTTP ERR kind={:?} raw={:?}", err.kind(), err.raw_os_error());
-                ui.set_metals_status("价格获取失败".into());
+            } else {
+                let code = RESULT_HTTP_CODE.load(Ordering::Relaxed);
+                let text = if code == 0 {
+                    "价格获取失败".to_string()
+                } else {
+                    format!("HTTP 状态 {}", code)
+                };
+                ui.set_metals_status(text.into());
             }
         }
-    }
 
-    fn tick(&mut self, ui: &MainWindow) {
-        let now = uptime_millis();
+        // Orphan recycle: a fetch stuck past FETCH_TIMEOUT_MS (dead network,
+        // connect retry loop) must not hold FETCH_PENDING forever. Release
+        // the slot so the cadence can start a fresh worker; the old thread,
+        // if it ever returns, fails the generation check above. The thread
+        // itself is detached and cannot be killed (kernel pthreads have no
+        // kill) — it dies on its own when the TCP stack gives up, and its
+        // stack + fd are reclaimed then.
+        if FETCH_PENDING.load(Ordering::Relaxed) {
+            let started = FETCH_STARTED_MS.load(Ordering::Relaxed);
+            if started != 0 && now.saturating_sub(started as u128) >= FETCH_TIMEOUT_MS {
+                println!("[METALS] fetch timeout, releasing slot");
+                FETCH_PENDING.store(false, Ordering::Relaxed);
+            }
+        }
 
         // Per-second wall-clock tick, but only rewrite the property on a
         // minute change (the equality guard avoids per-frame allocation).
@@ -556,22 +676,36 @@ impl MetalsFetcher {
         let first_due = now.saturating_sub(self.started_at) >= FIRST_FETCH_DELAY_MS;
         // `refreshing` doubles as the fetch trigger and the UI "in progress"
         // flag — set when the page is entered, the user taps refresh, or the
-        // periodic cadence elapses; cleared once fetch_prices returns.
+        // periodic cadence elapses. The fetch itself is non-blocking: it
+        // spawns a worker and the result lands on a later tick.
         let refresh_due = (self.refreshing && first_due)
             || (first_due && now.saturating_sub(self.last_refresh_ms) >= REFRESH_MS);
-        if refresh_due {
+        if refresh_due && !FETCH_PENDING.load(Ordering::Relaxed) {
             self.last_refresh_ms = now;
             if !self.refreshing {
                 self.refreshing = true;
                 ui.set_metals_refreshing(true);
             }
             println!("REFRESH");
+            FETCH_GENERATION.fetch_add(1, Ordering::Relaxed);
+            FETCH_STARTED_MS.store(now as u64, Ordering::Relaxed);
+            FETCH_PENDING.store(true, Ordering::Relaxed);
             self.fetch_prices(ui);
-            self.refreshing = false;
-            ui.set_metals_refreshing(false);
         }
     }
 }
+
+/// Format fixed-point hundredths back into the display string ("73456" ->
+/// "734.56"). Returns None for the zero value so a fetch without this
+/// field leaves the previous price on screen.
+fn format_fixed_price(cents: i32) -> Option<std::string::String> {
+    if cents == 0 {
+        return None;
+    }
+    Some(format!("{}.{:02}", cents / 100, (cents % 100).abs()))
+}
+
+const FETCH_THREAD_STACK_SIZE: usize = 24 * 1024;
 
 /// Connect the metals fetcher to the shared launcher window. The returned
 /// timer must stay alive for as long as the Slint event loop runs.
