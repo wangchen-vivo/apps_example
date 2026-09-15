@@ -12,11 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Scheduler and resource monitor backend.
-// Polls /proc/stat, /proc/meminfo, and /proc/0/task/<tid>/status on a
-// dedicated worker thread so the Slint UI thread never blocks on procfs
-// reads. The worker publishes parsed results into shared atomics and a
-// mutex-guarded task snapshot; the UI timer copies them into Slint models.
+// Scheduler and resource monitor backend. Slint's UI timer polls /proc/stat,
+// /proc/meminfo, and /proc/0/task/<tid>/status directly. This deliberately
+// avoids a per-page pthread stack on the constrained device heap.
 
 use crate::app_window::MainWindow;
 use crate::syscall_error;
@@ -33,17 +31,19 @@ use std::sync::Mutex;
 const POLL_MS: u64 = 500; // 2 Hz CPU/mem refresh rate
 const TASK_POLL_MS: u64 = 2000; // task list refresh rate (5x less churn)
 const CORE_COUNT: usize = 1; // ESP32-C6 is single-core RISC-V
-                             // Six compact rows keep the complete page below the renderer's 256-command
-                             // growth boundary; crossing it requests one contiguous 14336-byte block.
-const MAX_TASK_LINES: usize = 6;
-const TASK_NAME_BYTES: usize = 6;
+const MAX_TASK_LINES: usize = 8;
+/// BlueOS stores 16 bytes including the trailing NUL, so `/proc` can expose
+/// at most 15 name bytes. Keep that complete value; the UI adds no shorter cap.
+const KERNEL_TASK_NAME_MAX: usize = 15;
+const TID_COLUMN_BYTES: usize = MAX_TASK_LINES * (4 + 1) - 1;
+const TYPE_COLUMN_BYTES: usize = MAX_TASK_LINES * (5 + 1) - 1;
+const STATE_COLUMN_BYTES: usize = MAX_TASK_LINES * (4 + 1) - 1;
+const PRIO_COLUMN_BYTES: usize = MAX_TASK_LINES * (3 + 1) - 1;
+const NAME_COLUMN_BYTES: usize = MAX_TASK_LINES * (KERNEL_TASK_NAME_MAX + 1) - 1;
 /// Upper bound on kernel threads surfaced by /proc/0/task. The board runs
 /// ~10 threads; 32 leaves headroom while keeping the snapshot a single
 /// static block instead of a growable heap Vec.
 const MAX_TASKS: usize = 32;
-// Release ELF: worker_loop uses a 2496-byte direct frame. 6 KiB leaves room
-// for procfs/syscall call chains without keeping an 8-KiB stack resident.
-const WORKER_STACK_SIZE: usize = 6 * 1024;
 
 /// Snapshot of CPU idle/system ticks for computing delta usage.
 #[derive(Clone, Copy)]
@@ -176,9 +176,7 @@ fn parse_thread_status(content: &[u8], tid: usize) -> TaskEntry {
     }
 
     // State/kind map to enums; abbreviations are only materialized for the
-    // visible rows. Keeping glyph counts low is what keeps the software
-    // renderer below its 256-glyph texture-array growth point (a 14336-byte
-    // allocation that is the OOM point on this page).
+    // visible rows.
     let task_state = match state {
         "running" => TaskState::Running,
         "ready" => TaskState::Ready,
@@ -194,14 +192,14 @@ fn parse_thread_status(content: &[u8], tid: usize) -> TaskEntry {
         _ => TaskKind::Normal,
     };
 
-    // Name column shows the custom name verbatim (empty falls back to kind),
-    // truncated to the compact on-screen budget.
+    // Name column shows the complete kernel-visible name (empty falls back
+    // to kind). The kernel itself guarantees it is at most 15 bytes.
     let name_src = if name.is_empty() { kind } else { name };
-    let mut name_buf = [0u8; TASK_NAME_BYTES];
+    let mut name_buf = [0u8; KERNEL_TASK_NAME_MAX];
     let mut name_len = 0;
     for (dst, byte) in name_buf
         .iter_mut()
-        .zip(name_src.bytes().take(TASK_NAME_BYTES))
+        .zip(name_src.bytes().take(KERNEL_TASK_NAME_MAX))
     {
         *dst = byte;
         name_len += 1;
@@ -358,7 +356,7 @@ struct TaskEntry {
     priority: u8,
     kind: TaskKind,
     state: TaskState,
-    name: [u8; TASK_NAME_BYTES],
+    name: [u8; KERNEL_TASK_NAME_MAX],
     name_len: u8,
 }
 
@@ -370,7 +368,7 @@ impl TaskEntry {
             priority: 0,
             kind: TaskKind::Normal,
             state: TaskState::Unknown,
-            name: [0u8; TASK_NAME_BYTES],
+            name: [0u8; KERNEL_TASK_NAME_MAX],
             name_len: 0,
         }
     }
@@ -419,66 +417,42 @@ impl TaskState {
 }
 
 // ---------------------------------------------------------------------------
-// Shared worker output. The worker thread writes these; the UI timer reads.
-// All values are plain data so the worker never touches Slint/MainWindow.
+// Timer-published monitor data. All values are plain data; only the Slint
+// event-loop thread reads procfs and updates MainWindow.
 // ---------------------------------------------------------------------------
 
-/// CPU usage percent for the single core, computed by the worker.
+/// CPU usage percent for the single core, computed by the timer.
 static CPU_PCT: AtomicU32 = AtomicU32::new(0);
-/// Memory figures in kB (total / used / max-used), published by the worker.
+/// Memory figures in kB (total / used / max-used), published by the timer.
 static MEM_TOTAL_KB: AtomicI32 = AtomicI32::new(0);
 static MEM_USED_KB: AtomicI32 = AtomicI32::new(0);
 static MEM_MAX_USED_KB: AtomicI32 = AtomicI32::new(0);
-/// Static CPU model/ISA and current clock text, published by the worker.
+/// Static CPU model/ISA and current clock text, published by the timer.
 static CPU_MODEL: Mutex<String> = Mutex::new(String::new());
 static CPU_ISA: Mutex<String> = Mutex::new(String::new());
 static CPU_MHZ: Mutex<String> = Mutex::new(String::new());
-/// Publish flags — set once when the worker has valid data.
+/// Publish flags — set once when the timer has valid data.
 static CPUINFO_READY: AtomicBool = AtomicBool::new(false);
 /// Full task list, sorted by state (running/ready/other), published by the
-/// worker. Fixed-size so the snapshot never needs a heap allocation; the
+/// timer. Fixed-size so the snapshot never needs a heap allocation; the
 /// valid length lives in TASK_TOTAL. The UI thread locks it briefly to
 /// slice the visible window.
 static TASK_ENTRIES: Mutex<[TaskEntry; MAX_TASKS]> =
     Mutex::new([TaskEntry::placeholder(); MAX_TASKS]);
 static TASK_TOTAL: AtomicUsize = AtomicUsize::new(0);
 static TASK_VERSION: AtomicU32 = AtomicU32::new(0);
-/// Worker state for CPU delta calculation.
+/// Timer state for CPU delta calculation.
 static PREV_TICKS: Mutex<[CpuTickSnapshot; CORE_COUNT]> =
     Mutex::new([CpuTickSnapshot::zeroed(); CORE_COUNT]);
 static FIRST_STAT: AtomicBool = AtomicBool::new(true);
-/// Set true while the worker thread should keep running. The worker is
-/// spawned when the sched-mon page is entered and exits when it is left.
-static WORKER_RUNNING: AtomicBool = AtomicBool::new(false);
-static WORKER_SPAWNED: AtomicBool = AtomicBool::new(false);
-
-/// Start the background collector (called when the page is entered). The
-/// worker is finite so its stack is returned after every page exit.
-fn start_worker() {
-    if WORKER_RUNNING.swap(true, Ordering::AcqRel) {
-        return;
-    }
-    if !WORKER_SPAWNED.swap(true, Ordering::AcqRel) {
-        match std::thread::Builder::new()
-            .stack_size(WORKER_STACK_SIZE)
-            .spawn(worker_loop)
-        {
-            Ok(worker) => drop(worker),
-            Err(error) => {
-                WORKER_SPAWNED.store(false, Ordering::Release);
-                WORKER_RUNNING.store(false, Ordering::Release);
-                println!("[SCHED_MON] worker spawn failed: {error}");
-            }
-        }
+fn reset_collector() {
+    FIRST_STAT.store(true, Ordering::Relaxed);
+    if let Ok(mut ticks) = PREV_TICKS.lock() {
+        *ticks = [CpuTickSnapshot::zeroed(); CORE_COUNT];
     }
 }
 
-/// Stop the worker (page left). It notices this flag within one poll interval,
-/// returns, and BlueOS releases its complete 6-KiB pthread allocation.
-fn stop_worker() {
-    if !WORKER_RUNNING.swap(false, Ordering::AcqRel) {
-        return;
-    }
+fn clear_collector() {
     TASK_TOTAL.store(0, Ordering::Relaxed);
     CPU_PCT.store(0, Ordering::Relaxed);
     MEM_TOTAL_KB.store(0, Ordering::Relaxed);
@@ -486,8 +460,8 @@ fn stop_worker() {
     MEM_MAX_USED_KB.store(0, Ordering::Relaxed);
 }
 
-/// One full worker pass: read + parse every proc file, publish results.
-fn worker_pass() {
+/// One timer pass: read + parse CPU, memory, and static CPU info.
+fn collect_system_stats() {
     // ---- CPU usage ----
     if let Ok((stat_buf, stat_len)) = read_proc_file(b"/proc/stat\0") {
         let current_ticks = parse_proc_stat(&stat_buf[..stat_len]);
@@ -537,7 +511,7 @@ fn worker_pass() {
 
 /// Collect + publish the task list snapshot. Kept separate from the CPU/mem
 /// pass so it can run on a slower cadence and reduce heap churn.
-fn worker_collect_tasks() {
+fn collect_tasks() {
     let (tids, tids_len) = match list_task_entries() {
         Ok(result) => result,
         Err(_) => return,
@@ -561,7 +535,7 @@ fn worker_collect_tasks() {
                 priority: 0,
                 kind: TaskKind::Normal,
                 state: TaskState::Unknown,
-                name: [0u8; TASK_NAME_BYTES],
+                name: [0u8; KERNEL_TASK_NAME_MAX],
                 name_len: 0,
             }
         };
@@ -626,40 +600,7 @@ impl<const N: usize> core::fmt::Write for FixedText<N> {
     }
 }
 
-/// Worker entry. The small hand-off at the bottom prevents a lost wake-up
-/// when the user re-enters while the previous worker is just exiting.
-fn worker_loop() {
-    loop {
-        FIRST_STAT.store(true, Ordering::Relaxed);
-        PREV_TICKS
-            .lock()
-            .map(|mut g| *g = [CpuTickSnapshot::zeroed(); CORE_COUNT]);
-        let mut passes_since_tasks = u32::MAX; // collect on the first pass
-        while WORKER_RUNNING.load(Ordering::Acquire) {
-            worker_pass();
-            if passes_since_tasks >= (TASK_POLL_MS / POLL_MS) as u32 {
-                worker_collect_tasks();
-                passes_since_tasks = 0;
-            } else {
-                passes_since_tasks += 1;
-            }
-            librs::time::msleep(POLL_MS as libc::c_uint);
-        }
-
-        WORKER_SPAWNED.store(false, Ordering::Release);
-        if !WORKER_RUNNING.load(Ordering::Acquire) {
-            return;
-        }
-        if WORKER_SPAWNED
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return;
-        }
-    }
-}
-
-/// UI-side scroll state. The worker owns all data; this only tracks the
+/// UI-side scroll state. The timer owns all collection and tracks the
 /// window offset and copies the latest snapshot into the Slint models.
 struct SchedMonitor {
     /// 0-based page index. Offset for slicing = page_index * MAX_TASK_LINES,
@@ -669,6 +610,8 @@ struct SchedMonitor {
     total_tasks: usize,
     last_task_version: u32,
     task_dirty: bool,
+    task_snapshot_diagnostic_pending: bool,
+    polls_since_tasks: u32,
 }
 
 impl SchedMonitor {
@@ -678,6 +621,8 @@ impl SchedMonitor {
             total_tasks: 0,
             last_task_version: u32::MAX,
             task_dirty: true,
+            task_snapshot_diagnostic_pending: true,
+            polls_since_tasks: u32::MAX,
         }
     }
 
@@ -705,9 +650,9 @@ impl SchedMonitor {
         }
     }
 
-    /// Copy the latest worker-published task snapshot window into the Slint
+    /// Copy the latest timer-published task snapshot window into the Slint
     /// models, in place. Only changed rows dirty the scene. Each of the 5
-    /// columns is formatted as a 6-line string so the page uses 5 Text scene
+    /// columns is formatted as an 8-line string so the page uses 5 Text scene
     /// items total instead of 40 cells.
     fn copy_task_window(&mut self, ui: &MainWindow) {
         let copied_version = TASK_VERSION.load(Ordering::Acquire);
@@ -720,11 +665,11 @@ impl SchedMonitor {
         let offset = self.page_index * MAX_TASK_LINES;
         let total = self.total_tasks.min(MAX_TASKS);
 
-        let mut tid_col = FixedText::<32>::new();
-        let mut type_col = FixedText::<36>::new();
-        let mut state_col = FixedText::<32>::new();
-        let mut prio_col = FixedText::<24>::new();
-        let mut name_col = FixedText::<44>::new();
+        let mut tid_col = FixedText::<TID_COLUMN_BYTES>::new();
+        let mut type_col = FixedText::<TYPE_COLUMN_BYTES>::new();
+        let mut state_col = FixedText::<STATE_COLUMN_BYTES>::new();
+        let mut prio_col = FixedText::<PRIO_COLUMN_BYTES>::new();
+        let mut name_col = FixedText::<NAME_COLUMN_BYTES>::new();
         let mut row = 0;
         for entry in snapshot[..total].iter().skip(offset).take(MAX_TASK_LINES) {
             if row > 0 {
@@ -767,16 +712,27 @@ impl SchedMonitor {
         ui.set_task_total(self.total_tasks as i32);
         ui.set_task_page(self.page() as i32);
         ui.set_task_page_count(self.page_count() as i32);
+        if self.task_snapshot_diagnostic_pending && self.total_tasks > 0 {
+            self.task_snapshot_diagnostic_pending = false;
+            crate::sched_mon_task_snapshot_published();
+        }
         self.last_task_version = copied_version;
         self.task_dirty = false;
     }
 
-    /// UI-side tick: copy the worker's latest data into Slint models.
-    /// Does zero /proc I/O — the worker thread owns all reads.
+    /// Timer tick: collect procfs data and copy it into Slint models.
     fn tick(&mut self, ui: &MainWindow) {
         // Only touch the models when the sched-mon page (app 6) is active.
         if ui.get_current_app() != 6 {
             return;
+        }
+
+        collect_system_stats();
+        if self.polls_since_tasks >= (TASK_POLL_MS / POLL_MS) as u32 {
+            collect_tasks();
+            self.polls_since_tasks = 0;
+        } else {
+            self.polls_since_tasks += 1;
         }
 
         // ---- Task list ----
@@ -813,7 +769,7 @@ impl SchedMonitor {
             ui.set_mem_max_used_kb(max_used);
         }
 
-        // ---- CPU info (published once by the worker) ----
+        // ---- CPU info (published once by the timer) ----
         if CPUINFO_READY.load(Ordering::Relaxed) {
             if let Ok(m) = CPU_MODEL.lock() {
                 let cur: slint::SharedString = ui.get_cpu_model();
@@ -842,9 +798,7 @@ impl SchedMonitor {
 pub(crate) fn install(ui: &MainWindow) -> slint::Timer {
     let monitor = Rc::new(RefCell::new(SchedMonitor::new()));
 
-    // Bind the refresh-tasks callback from the Slint UI. The worker already
-    // keeps the snapshot fresh; this just asks the next timer tick to copy
-    // the latest window into the models immediately.
+    // Bind the refresh-tasks callback from the Slint UI.
     {
         let monitor = monitor.clone();
         let refresh_ui = ui.as_weak();
@@ -858,8 +812,7 @@ pub(crate) fn install(ui: &MainWindow) -> slint::Timer {
     }
 
     // Task list scroll: swipe-up/down adjust the window offset; the next tick
-    // (≤POLL_MS) re-slices the visible rows. No immediate /proc read — the
-    // worker owns the data.
+    // (≤POLL_MS) re-slices the visible rows.
     {
         let monitor = monitor.clone();
         ui.on_task_scroll_up(move || {
@@ -899,9 +852,13 @@ pub(crate) fn install(ui: &MainWindow) -> slint::Timer {
         }
         active_monitor.borrow_mut().task_dirty = true;
         if active {
-            start_worker();
+            active_monitor.borrow_mut().task_snapshot_diagnostic_pending = true;
+            active_monitor.borrow_mut().polls_since_tasks = u32::MAX;
+            reset_collector();
+            crate::sched_mon_renderer_entered();
         } else {
-            stop_worker();
+            clear_collector();
+            crate::sched_mon_renderer_exited();
             if let Some(ui) = active_ui.upgrade() {
                 // Drop the five SharedString payloads retained by Slint while
                 // this page is hidden. Empty SharedString has no text buffer.

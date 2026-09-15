@@ -58,10 +58,11 @@ export component AudioPage inherits AppPage {
     }
 
     // ===== Transport buttons =====
-    // SD-card mode: [上一首][播放][停止][下一首] in one row; built-in mode:
-    // [播放][停止] centred.
+    // SD-card mode: [上一首][播放/暂停][下一首] centred as one row; built-in
+    // mode: a single centred [播放/暂停] button.
+    // Three-button group: 100 + 10 + 100 + 10 + 110 = 330 px wide.
     if root.has-sd-audio: Rectangle {
-        x: 20px; y: 204px; width: 100px; height: 52px;
+        x: parent.width / 2 - 165px; y: 204px; width: 100px; height: 52px;
         background: Theme.raised-background; border-radius: 10px;
         border-width: 1px; border-color: Theme.border-color;
 
@@ -78,13 +79,13 @@ export component AudioPage inherits AppPage {
     }
 
     Rectangle {
-        x: root.has-sd-audio ? 130px : parent.width / 2 - 108px;
+        x: root.has-sd-audio ? parent.width / 2 - 55px : parent.width / 2 - 50px;
         y: 204px; width: 100px; height: 52px;
-        background: root.accent; border-radius: 10px;
+        background: root.playing ? #ff6b6b : root.accent; border-radius: 10px;
 
         Text {
             x: 0; y: 0; width: parent.width; height: parent.height;
-            text: "播放";
+            text: root.playing ? "暂停" : "播放";
             color: #06241c; font-size: Theme.font-base; font-weight: 700;
             horizontal-alignment: center; vertical-alignment: center;
         }
@@ -94,25 +95,8 @@ export component AudioPage inherits AppPage {
         }
     }
 
-    Rectangle {
-        x: root.has-sd-audio ? 240px : parent.width / 2 + 12px;
-        y: 204px; width: 100px; height: 52px;
-        background: #ff6b6b; border-radius: 10px;
-
-        Text {
-            x: 0; y: 0; width: parent.width; height: parent.height;
-            text: "停止";
-            color: #ffffff; font-size: Theme.font-base; font-weight: 700;
-            horizontal-alignment: center; vertical-alignment: center;
-        }
-
-        TouchArea {
-            clicked => { root.audio-stop(); }
-        }
-    }
-
     if root.has-sd-audio: Rectangle {
-        x: 350px; y: 204px; width: 110px; height: 52px;
+        x: parent.width / 2 + 55px; y: 204px; width: 110px; height: 52px;
         background: Theme.raised-background; border-radius: 10px;
         border-width: 1px; border-color: Theme.border-color;
 

@@ -191,11 +191,12 @@ impl FlashJournal {
         })
     }
 
-    fn write_next(&mut self, device: &FlashDevice) -> Result<(usize, u32, u128)> {
+    fn write_next(&mut self, device: &FlashDevice) -> Result<(usize, u32, (u128, u128, u128))> {
         let slot = self.next_slot;
         let sequence = self.next_sequence;
         let base = slot * SECTOR_SIZE;
 
+        let erase_start = crate::uptime_micros();
         device.erase_slot(slot).map_err(|error| {
             Error::new(
                 error.kind(),
@@ -223,6 +224,7 @@ impl FlashJournal {
                 ),
             ));
         }
+        let erase_us = crate::uptime_micros().saturating_sub(erase_start);
 
         let mut payload = vec![0u8; PAYLOAD_SIZE];
         fill_payload(&mut payload, sequence);
@@ -242,6 +244,7 @@ impl FlashJournal {
                     format!("header write failed: slot={slot}: {error}"),
                 )
             })?;
+        let write_start = crate::uptime_micros();
         device
             .write_all_at(base + HEADER_SIZE, &payload)
             .map_err(|error| {
@@ -296,6 +299,7 @@ impl FlashJournal {
                 ),
             ));
         }
+        let io_us = crate::uptime_micros().saturating_sub(write_start);
 
 
         self.used[slot] = true;
@@ -305,7 +309,7 @@ impl FlashJournal {
             .find(|candidate| !self.used[*candidate])
             .unwrap_or(search_start);
         self.next_sequence = sequence.wrapping_add(1).max(1);
-        Ok((slot, sequence, 0))
+        Ok((slot, sequence, (erase_us, io_us, 0)))
     }
 }
 
@@ -348,7 +352,7 @@ fn run_write_thread() {
     // Live-speed sliding window: the realtime figure is the wall span across
     // the last WINDOW records (so scheduling gaps count and the value settles
     // to a steady number instead of ramping up from the run's average).
-    const SPEED_WINDOW: usize = 4;
+    const SPEED_WINDOW: usize = 16;
     let mut window_micros = [0u128; SPEED_WINDOW];
     let mut window_idx = 0usize;
     for _ in 0..RECORDS_PER_RUN {
@@ -357,7 +361,7 @@ fn run_write_thread() {
             return;
         }
         match journal.write_next(&device) {
-            Ok((slot, sequence, _busy_us)) => {
+            Ok((slot, sequence, (erase_us, io_us, _))) => {
                 let done = RECORDS_DONE.load(Ordering::Relaxed) + 1;
                 RECORDS_DONE.store(done, Ordering::Relaxed);
                 LAST_SLOT.store(slot as u32, Ordering::Relaxed);

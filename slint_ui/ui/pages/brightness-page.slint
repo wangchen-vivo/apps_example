@@ -74,17 +74,17 @@ export component BrightnessPage inherits AppPage {
     // Coarse adjustment buttons remain available below the track.
     Rectangle {
         x: 144px; y: 260px; width: 80px; height: 72px;
-        background: plus-area.pressed ? Theme.pressed-background : Theme.raised-background;
-        border-width: 1px; border-color: Theme.border-color; border-radius: 14px;
-        Text { width: parent.width; height: parent.height; text: "+"; color: root.accent; font-size: Theme.font-lg; font-weight: 800; horizontal-alignment: center; vertical-alignment: center; }
-        plus-area := TouchArea { width: parent.width; height: parent.height; clicked => { root.brightness = min(root.brightness + 10, 100); root.set-brightness(root.brightness); root.commit-brightness(root.brightness); } }
-    }
-    Rectangle {
-        x: 256px; y: 260px; width: 80px; height: 72px;
         background: minus-area.pressed ? Theme.pressed-background : Theme.raised-background;
         border-width: 1px; border-color: Theme.border-color; border-radius: 14px;
         Text { width: parent.width; height: parent.height; text: "−"; color: root.accent; font-size: Theme.font-lg; font-weight: 800; horizontal-alignment: center; vertical-alignment: center; }
         minus-area := TouchArea { width: parent.width; height: parent.height; clicked => { root.brightness = max(root.brightness - 10, root.min-brightness); root.set-brightness(root.brightness); root.commit-brightness(root.brightness); } }
+    }
+    Rectangle {
+        x: 256px; y: 260px; width: 80px; height: 72px;
+        background: plus-area.pressed ? Theme.pressed-background : Theme.raised-background;
+        border-width: 1px; border-color: Theme.border-color; border-radius: 14px;
+        Text { width: parent.width; height: parent.height; text: "+"; color: root.accent; font-size: Theme.font-lg; font-weight: 800; horizontal-alignment: center; vertical-alignment: center; }
+        plus-area := TouchArea { width: parent.width; height: parent.height; clicked => { root.brightness = min(root.brightness + 10, 100); root.set-brightness(root.brightness); root.commit-brightness(root.brightness); } }
     }
 
     Text {

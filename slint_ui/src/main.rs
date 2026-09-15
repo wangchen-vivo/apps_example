@@ -175,6 +175,26 @@ static TOUCH_PRESSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 // TOUCH_PRESSED: setting a Slint property would itself dirty the scene.
 static TOUCH_MOVED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+const RENDERER_ACTION_RESERVE_SCHED_SCENE: u8 = 1 << 0;
+static RENDERER_ACTIONS: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+pub(crate) fn sched_mon_renderer_entered() {
+    RENDERER_ACTIONS.fetch_or(
+        RENDERER_ACTION_RESERVE_SCHED_SCENE,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+pub(crate) fn sched_mon_task_snapshot_published() {
+    RENDERER_ACTIONS.fetch_or(
+        RENDERER_ACTION_RESERVE_SCHED_SCENE,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+pub(crate) fn sched_mon_renderer_exited() {}
+
 pub(crate) fn touch_is_pressed() -> bool {
     TOUCH_PRESSED.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -713,49 +733,6 @@ pub(crate) fn uptime_micros() -> u128 {
     (ts.tv_sec as u128) * 1_000_000 + (ts.tv_nsec as u128) / 1_000
 }
 
-/// Print a one-line heap snapshot read from /proc/meminfo. Only prints when
-/// a tracked value actually changed, so the serial log does not flood with
-/// identical lines every interval.
-pub(crate) fn log_mem_snapshot() {
-    use std::io::Read;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static LAST_USED: AtomicU64 = AtomicU64::new(u64::MAX);
-    static LAST_FREE: AtomicU64 = AtomicU64::new(u64::MAX);
-    static LAST_MAX: AtomicU64 = AtomicU64::new(u64::MAX);
-
-    let Ok(mut file) = std::fs::File::open("/proc/meminfo") else {
-        return;
-    };
-    let mut buf = std::string::String::new();
-    if file.read_to_string(&mut buf).is_err() {
-        return;
-    }
-    let (mut total, mut used, mut max_used, mut free, mut largest) =
-        (0u64, 0u64, 0u64, 0u64, 0u64);
-    for line in buf.lines() {
-        let Some((key, value)) = line.split_once(':') else { continue };
-        let v = value.split_whitespace().next().and_then(|s| s.parse::<u64>().ok());
-        match key.trim() {
-            "MemTotal" => total = v.unwrap_or(0),
-            "MemUsed" => used = v.unwrap_or(0),
-            "MemMaxUsed" => max_used = v.unwrap_or(0),
-            "MemAvailable" => free = v.unwrap_or(0),
-            "MemLargestFree" => largest = v.unwrap_or(0),
-            _ => {}
-        }
-    }
-    if LAST_USED.swap(used, Ordering::Relaxed) == used
-        && LAST_FREE.swap(free, Ordering::Relaxed) == free
-        && LAST_MAX.swap(max_used, Ordering::Relaxed) == max_used
-    {
-        return;
-    }
-    println!(
-        "[MEM] t={}s total={total} used={used} maxUsed={max_used} free={free} largest={largest} kB",
-        uptime_millis() / 1000
-    );
-}
-
 struct BluekernelBackend {
     window: RefCell<Option<Rc<slint::platform::software_renderer::MinimalSoftwareWindow>>>,
 }
@@ -785,6 +762,10 @@ impl slint::platform::Platform for BluekernelBackend {
         std::time::Duration::from_millis(t as u64)
     }
 
+    fn debug_log(&self, arguments: core::fmt::Arguments) {
+        println!("[SLINT] {arguments}");
+    }
+
     fn run_event_loop(&self) -> Result<(), slint::PlatformError> {
         let mut fb = FbFile::open().map_err(|err| slint::PlatformError::Other(err.to_string()))?;
         let mut touch = match TouchFile::open() {
@@ -796,17 +777,9 @@ impl slint::platform::Platform for BluekernelBackend {
         };
         let mut touch_error_reported = false;
         let mut frame_number = 0u64;
-        let mut last_mem_snap_ms = 0u128;
-        const MEM_SNAP_INTERVAL_MS: u128 = 2000;
 
         loop {
             slint::platform::update_timers_and_animations();
-
-            let now_ms = uptime_millis();
-            if now_ms.saturating_sub(last_mem_snap_ms) >= MEM_SNAP_INTERVAL_MS {
-                last_mem_snap_ms = now_ms;
-                log_mem_snapshot();
-            }
 
             if let Some(window) = self.window.borrow().clone() {
                 // Dispatch input before drawing so its visual state is visible
@@ -820,6 +793,21 @@ impl slint::platform::Platform for BluekernelBackend {
                         }
                         Err(_) => {}
                     }
+                }
+
+                // Page callbacks run while timers/input are dispatched above.
+                // Consume their renderer requests before the transition's
+                // first frame.
+                let renderer_actions = RENDERER_ACTIONS.load(std::sync::atomic::Ordering::Relaxed);
+                if renderer_actions & RENDERER_ACTION_RESERVE_SCHED_SCENE != 0 {
+                    // Full 8-row task snapshots observed on this page stay
+                    // below 256 SceneItems and SceneTextures. Reserve once so
+                    // Vec growth cannot leave old+new 2/4/7 KiB blocks behind.
+                    window.request_scene_capacity_hint(5, 256, 256);
+                    RENDERER_ACTIONS.fetch_and(
+                        !RENDERER_ACTION_RESERVE_SCHED_SCENE,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                 }
 
                 let has_animations = window.window().has_active_animations();
@@ -886,7 +874,6 @@ impl slint::platform::Platform for BluekernelBackend {
                         );
                     }
                 }
-
                 // After Slint finishes drawing its overlay (the image viewer frame),
                 // check for a pending PNG render request and stream it to the
                 // framebuffer.

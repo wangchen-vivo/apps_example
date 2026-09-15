@@ -410,6 +410,32 @@ fn set_playing(ui: &MainWindow, source: &AudioSource, playing: bool) {
     }
 }
 
+/// Pause playback on the audio page: stop the 10 ms tick (by clearing the
+/// playing flag), mute the DAC and drop the I2S handle so the kernel drains
+/// the TX ring and stops the DMA. The source offset and the WAV handle are
+/// kept, so a later play press resumes exactly where playback stopped.
+fn pause_playback(ui: &MainWindow) {
+    println!("[AUDIO] pause at offset");
+    PLAYER.with(|p| {
+        let source = p.borrow().source.clone();
+        set_playing(ui, &source, false);
+    });
+    if ui.get_sd_audio_open() {
+        ui.set_sd_audio_status("已暂停".into());
+    } else {
+        ui.set_audio_status("已暂停".into());
+    }
+    VOLUME_CONTROLLER.with(|slot| {
+        if let Some(controller) = slot.borrow().as_ref() {
+            controller.borrow().set_mute(true);
+        }
+    });
+    PLAYER.with(|p| {
+        let mut player = p.borrow_mut();
+        drop(player.file.take());
+    });
+}
+
 const AUDIO_VOLUME_DEVICE: &[u8] = b"/dev/audio_volume\0";
 
 struct AudioVolumeFd(libc::c_int);
@@ -736,7 +762,31 @@ pub(crate) fn install(ui: &MainWindow) -> slint::Timer {
             None => return,
         };
 
-        if ui.get_audio_playing() {
+        // The merged play/pause button: pause while the current UI is playing,
+        // resume a paused source (offset kept, I2S handle dropped), otherwise
+        // start from the beginning. Two entry points share the same player:
+        // the audio page (audio-playing) and the SD card viewer (sd-playing).
+        let viewer_open = ui.get_sd_audio_open();
+        let page_playing = ui.get_audio_playing();
+        if (viewer_open && ui.get_sd_audio_playing()) || (!viewer_open && page_playing) {
+            pause_playback(&ui);
+            return;
+        }
+
+        // Resume a paused source: the offset is mid-stream and the source
+        // matches the current UI context. In the SD viewer only a WAV File
+        // source may resume — a built-in PCM pause belongs to the audio page
+        // and must not leak into the viewer. Re-arming the playing flag lets
+        // the 10 ms tick lazily reopen /dev/i2s0 and continue from offset.
+        if PLAYER.with(|p| {
+            let player = p.borrow();
+            let resume_source = match player.source {
+                AudioSource::File { .. } => true,
+                AudioSource::Builtin => !viewer_open,
+            };
+            resume_source && player.offset > 0 && player.offset < player.source.total_len()
+        }) {
+            start_playback(&ui, "resume");
             return;
         }
 
@@ -789,11 +839,14 @@ pub(crate) fn install(ui: &MainWindow) -> slint::Timer {
         // Mute before draining so the stop transition is silent.
         stop_controller.borrow().set_mute(true);
         // Drop the I2S file handle so the kernel drains the TX ring and
-        // stops the DMA engine (File drop → close → drain_and_stop).
+        // stops the DMA engine (File drop → close → drain_and_stop). Reset
+        // the player so the next play starts from the beginning: stopping is
+        // distinct from pausing, which deliberately keeps the source offset.
         PLAYER.with(|p| {
             let mut player = p.borrow_mut();
             drop(player.file.take());
             drop(player.wav_file.take());
+            *player = AudioPlayer::new();
         });
     });
 
