@@ -34,9 +34,8 @@ use std::{
 };
 
 // Board reaches the public APIs through a plain-HTTP reverse proxy on the host
-// (kernel has TCP but no DNS/TLS).
-const HTTP_PROXY_IP: [u8; 4] = [10, 171, 198, 12];
-const HTTP_PROXY_PORT: u16 = 18085;
+// (kernel has TCP but no DNS/TLS). The proxy address is configured in
+// app.conf (CONFIG_HTTP_PROXY_IP / CONFIG_HTTP_PROXY_PORT).
 const TICK_MS: u64 = 1000; // per-second wall-clock tick
 const REFRESH_MS: u128 = 60 * 1000; // price refresh cadence
 const FIRST_FETCH_DELAY_MS: u128 = 1500; // let the network settle after boot
@@ -122,6 +121,15 @@ struct TcpSocket {
 fn config_str(value: &[u8]) -> &str {
     let value = value.split(|&byte| byte == 0).next().unwrap_or(value);
     core::str::from_utf8(value).unwrap_or("")
+}
+
+/// Parse "a.b.c.d" into [a, b, c, d]; zeroes on any malformed octet.
+fn parse_ipv4(text: &str) -> [u8; 4] {
+    let mut out = [0u8; 4];
+    for (i, octet) in text.split('.').take(4).enumerate() {
+        out[i] = octet.trim().parse().unwrap_or(0);
+    }
+    out
 }
 
 impl TcpSocket {
@@ -818,7 +826,9 @@ pub(crate) fn install(ui: &MainWindow) -> slint::Timer {
 /// Execute exactly one request and return. Keeping this worker finite is
 /// essential on the 303-KiB heap: its 6-KiB stack must not remain resident.
 fn fetch_once(generation: u32) {
-    match http_get(HTTP_PROXY_IP, HTTP_PROXY_PORT) {
+    let ip = parse_ipv4(config_str(blueos_kconfig::CONFIG_HTTP_PROXY_IP));
+    let port = blueos_kconfig::CONFIG_HTTP_PROXY_PORT as u16;
+    match http_get(ip, port) {
         Ok(result) if result.status == 200 => {
             println!("[HTTP:metals] response 200");
             RESULT_HTTP_CODE.store(200, Ordering::Relaxed);
