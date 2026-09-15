@@ -39,7 +39,7 @@ export component AudioPage inherits AppPage {
         }
 
         Text {
-            x: 92px; y: 16px; width: 200px; height: 36px;
+            x: 92px; y: 16px; width: parent.width - self.x - 20px; height: 36px;
             text: root.has-sd-audio ? root.track-title : "audio";
             color: Theme.primary-text;
             font-size: Theme.font-base; font-weight: 800;
@@ -48,7 +48,7 @@ export component AudioPage inherits AppPage {
         }
 
         Text {
-            x: 92px; y: 54px; width: 200px; height: 22px;
+            x: 92px; y: 54px; width: parent.width - self.x - 20px; height: 22px;
             text: root.status-text;
             color: Theme.muted-text;
             font-size: Theme.font-sm;
