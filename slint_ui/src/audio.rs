@@ -281,12 +281,17 @@ fn playback_tick(ui: &MainWindow) {
         }
 
         // Fetch the next raw PCM chunk: slice from the built-in buffer or
-        // read from the source WAV file on the SD card.
-        let raw_len = RAW_CHUNK.min(total - player.offset) & !1;
+        // read from the source WAV file on the SD card. Saturating so an
+        // offset that overshot the declared end cannot underflow and start
+        // sending huge chunk sizes.
+        let raw_len = RAW_CHUNK.min(total.saturating_sub(player.offset)) & !1;
         if raw_len == 0 {
             // Playback complete — close /dev/i2s0 so the kernel drains the
             // TX ring and stops the DMA engine (File drop → close → drain_and_stop).
             println!("[AUDIO] playback done ({} bytes)", player.offset);
+            // Reach the declared end so a later play press starts from the
+            // beginning instead of mis-detecting a pause to resume.
+            player.offset = total;
             set_status(ui, &player.source, "播放完成".to_string());
             set_playing(ui, &player.source, false);
             drop(player.file.take());
@@ -332,6 +337,11 @@ fn playback_tick(ui: &MainWindow) {
                 };
                 if n == 0 {
                     println!("[AUDIO] playback done ({} bytes)", offset);
+                    // The file hit EOF before the declared data chunk size
+                    // (e.g. padded header). Mark the source fully played so a
+                    // later play press restarts instead of resuming a finished
+                    // track with no WAV handle.
+                    player.offset = total;
                     set_status(ui, &player.source, "播放完成".to_string());
                     set_playing(ui, &player.source, false);
                     drop(player.file.take());
