@@ -640,6 +640,13 @@ pub(crate) fn install(ui: &MainWindow) -> slint::Timer {
     };
     VOLUME_CONTROLLER.with(|slot| *slot.borrow_mut() = Some(volume_controller.clone()));
 
+    // Sync the UI volume with the codec at startup so every entry point
+    // (audio page, SD-card viewer) displays the actual hardware level.
+    if let Some(ui) = ui_weak.upgrade() {
+        let value = volume_controller.borrow().get();
+        ui.set_audio_volume(value as i32);
+    }
+
     let vol_ui_weak = ui.as_weak();
     let vol_controller = volume_controller.clone();
     ui.on_set_audio_volume(move |value| {
