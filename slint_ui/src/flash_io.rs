@@ -144,6 +144,25 @@ struct FlashJournal {
     next_sequence: u32,
 }
 
+/// Per-run heap buffers reused across every record. Allocating them once at
+/// thread start (instead of three vec! per record) keeps the heap from being
+/// fragmented by 128 rounds of 12 KiB alloc/free churn.
+struct WriteBuffers {
+    erased: Vec<u8>,
+    payload: Vec<u8>,
+    verify: Vec<u8>,
+}
+
+impl WriteBuffers {
+    fn new() -> Self {
+        Self {
+            erased: vec![0u8; SECTOR_SIZE],
+            payload: vec![0u8; PAYLOAD_SIZE],
+            verify: vec![0u8; PAYLOAD_SIZE],
+        }
+    }
+}
+
 impl FlashJournal {
     fn scan(device: &FlashDevice) -> Result<Self> {
         let mut used = [false; SLOT_COUNT];
@@ -191,7 +210,11 @@ impl FlashJournal {
         })
     }
 
-    fn write_next(&mut self, device: &FlashDevice) -> Result<(usize, u32, (u128, u128, u128))> {
+    fn write_next(
+        &mut self,
+        device: &FlashDevice,
+        bufs: &mut WriteBuffers,
+    ) -> Result<(usize, u32, (u128, u128, u128))> {
         let slot = self.next_slot;
         let sequence = self.next_sequence;
         let base = slot * SECTOR_SIZE;
@@ -203,8 +226,8 @@ impl FlashJournal {
                 format!("erase failed: slot={slot} offset=0x{base:08x}: {error}"),
             )
         })?;
-        let mut erased = vec![0u8; SECTOR_SIZE];
-        device.read_exact_at(base, &mut erased).map_err(|error| {
+        let erased = &mut bufs.erased[..];
+        device.read_exact_at(base, erased).map_err(|error| {
             Error::new(
                 error.kind(),
                 format!("erase readback failed: slot={slot} offset=0x{base:08x}: {error}"),
@@ -226,9 +249,9 @@ impl FlashJournal {
         }
         let erase_us = crate::uptime_micros().saturating_sub(erase_start);
 
-        let mut payload = vec![0u8; PAYLOAD_SIZE];
-        fill_payload(&mut payload, sequence);
-        let crc = crc32(&payload);
+        let payload = &mut bufs.payload[..];
+        fill_payload(payload, sequence);
+        let crc = crc32(payload);
         let mut header = [0xff; HEADER_SIZE];
         write_u32(&mut header, 0, MAGIC);
         write_u32(&mut header, 4, FORMAT_VERSION);
@@ -253,16 +276,16 @@ impl FlashJournal {
                     format!("payload write failed: slot={slot}: {error}"),
                 )
             })?;
-        let mut verify = vec![0u8; PAYLOAD_SIZE];
+        let verify = &mut bufs.verify[..];
         device
-            .read_exact_at(base + HEADER_SIZE, &mut verify)
+            .read_exact_at(base + HEADER_SIZE, verify)
             .map_err(|error| {
                 Error::new(
                     error.kind(),
                     format!("payload readback failed: slot={slot}: {error}"),
                 )
             })?;
-        let actual_crc = crc32(&verify);
+        let actual_crc = crc32(verify);
         if let Some((index, (expected, actual))) = payload
             .iter()
             .copied()
@@ -355,12 +378,14 @@ fn run_write_thread() {
     const SPEED_WINDOW: usize = 16;
     let mut window_micros = [0u128; SPEED_WINDOW];
     let mut window_idx = 0usize;
+    // Reused across all records; freed when this thread returns.
+    let mut bufs = WriteBuffers::new();
     for _ in 0..RECORDS_PER_RUN {
         if !RUN_ACTIVE.load(Ordering::Relaxed) {
             // A new run replaced this one; stop quietly.
             return;
         }
-        match journal.write_next(&device) {
+        match journal.write_next(&device, &mut bufs) {
             Ok((slot, sequence, (erase_us, io_us, _))) => {
                 let done = RECORDS_DONE.load(Ordering::Relaxed) + 1;
                 RECORDS_DONE.store(done, Ordering::Relaxed);
