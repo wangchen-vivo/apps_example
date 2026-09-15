@@ -733,6 +733,49 @@ pub(crate) fn uptime_micros() -> u128 {
     (ts.tv_sec as u128) * 1_000_000 + (ts.tv_nsec as u128) / 1_000
 }
 
+/// Print a one-line heap snapshot read from /proc/meminfo. Only prints when
+/// a tracked value actually changed, so the serial log does not flood with
+/// identical lines every interval.
+pub(crate) fn log_mem_snapshot() {
+    use std::io::Read;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST_USED: AtomicU64 = AtomicU64::new(u64::MAX);
+    static LAST_FREE: AtomicU64 = AtomicU64::new(u64::MAX);
+    static LAST_MAX: AtomicU64 = AtomicU64::new(u64::MAX);
+
+    let Ok(mut file) = std::fs::File::open("/proc/meminfo") else {
+        return;
+    };
+    let mut buf = std::string::String::new();
+    if file.read_to_string(&mut buf).is_err() {
+        return;
+    }
+    let (mut total, mut used, mut max_used, mut free, mut largest) =
+        (0u64, 0u64, 0u64, 0u64, 0u64);
+    for line in buf.lines() {
+        let Some((key, value)) = line.split_once(':') else { continue };
+        let v = value.split_whitespace().next().and_then(|s| s.parse::<u64>().ok());
+        match key.trim() {
+            "MemTotal" => total = v.unwrap_or(0),
+            "MemUsed" => used = v.unwrap_or(0),
+            "MemMaxUsed" => max_used = v.unwrap_or(0),
+            "MemAvailable" => free = v.unwrap_or(0),
+            "MemLargestFree" => largest = v.unwrap_or(0),
+            _ => {}
+        }
+    }
+    if LAST_USED.swap(used, Ordering::Relaxed) == used
+        && LAST_FREE.swap(free, Ordering::Relaxed) == free
+        && LAST_MAX.swap(max_used, Ordering::Relaxed) == max_used
+    {
+        return;
+    }
+    println!(
+        "[MEM] t={}s total={total} used={used} maxUsed={max_used} free={free} largest={largest} kB",
+        uptime_millis() / 1000
+    );
+}
+
 struct BluekernelBackend {
     window: RefCell<Option<Rc<slint::platform::software_renderer::MinimalSoftwareWindow>>>,
 }
@@ -777,9 +820,17 @@ impl slint::platform::Platform for BluekernelBackend {
         };
         let mut touch_error_reported = false;
         let mut frame_number = 0u64;
+        let mut last_mem_snap_ms = 0u128;
+        const MEM_SNAP_INTERVAL_MS: u128 = 2000;
 
         loop {
             slint::platform::update_timers_and_animations();
+
+            let now_ms = uptime_millis();
+            if now_ms.saturating_sub(last_mem_snap_ms) >= MEM_SNAP_INTERVAL_MS {
+                last_mem_snap_ms = now_ms;
+                log_mem_snapshot();
+            }
 
             if let Some(window) = self.window.borrow().clone() {
                 // Dispatch input before drawing so its visual state is visible
