@@ -733,15 +733,18 @@ pub(crate) fn uptime_micros() -> u128 {
     (ts.tv_sec as u128) * 1_000_000 + (ts.tv_nsec as u128) / 1_000
 }
 
-/// Print a one-line heap snapshot read from /proc/meminfo. Only prints when
-/// a tracked value actually changed, so the serial log does not flood with
-/// identical lines every interval.
-pub(crate) fn log_mem_snapshot() {
+/// Print a one-line heap snapshot read from /proc/meminfo, plus the software
+/// renderer's partial-rendering cache stats. Only prints when a tracked value
+/// actually changed, so the serial log does not flood with identical lines.
+pub(crate) fn log_mem_snapshot(
+    window: Option<&slint::platform::software_renderer::MinimalSoftwareWindow>,
+) {
     use std::io::Read;
     use std::sync::atomic::{AtomicU64, Ordering};
     static LAST_USED: AtomicU64 = AtomicU64::new(u64::MAX);
     static LAST_FREE: AtomicU64 = AtomicU64::new(u64::MAX);
     static LAST_MAX: AtomicU64 = AtomicU64::new(u64::MAX);
+    static LAST_CACHE: AtomicU64 = AtomicU64::new(u64::MAX);
 
     let Ok(mut file) = std::fs::File::open("/proc/meminfo") else {
         return;
@@ -752,6 +755,7 @@ pub(crate) fn log_mem_snapshot() {
     }
     let (mut total, mut used, mut max_used, mut free, mut largest) =
         (0u64, 0u64, 0u64, 0u64, 0u64);
+    let mut buckets = [0u64; 6];
     for line in buf.lines() {
         let Some((key, value)) = line.split_once(':') else { continue };
         let v = value.split_whitespace().next().and_then(|s| s.parse::<u64>().ok());
@@ -761,17 +765,28 @@ pub(crate) fn log_mem_snapshot() {
             "MemMaxUsed" => max_used = v.unwrap_or(0),
             "MemAvailable" => free = v.unwrap_or(0),
             "MemLargestFree" => largest = v.unwrap_or(0),
+            "Blk<64B" => buckets[0] = v.unwrap_or(0),
+            "Blk64-256B" => buckets[1] = v.unwrap_or(0),
+            "Blk256-1K" => buckets[2] = v.unwrap_or(0),
+            "Blk1K-4K" => buckets[3] = v.unwrap_or(0),
+            "Blk4K-16K" => buckets[4] = v.unwrap_or(0),
+            "Blk>16K" => buckets[5] = v.unwrap_or(0),
             _ => {}
         }
     }
+    let (cache_entries, cache_capacity, cache_gen) = window
+        .map(|w| w.partial_cache_stats())
+        .unwrap_or((0, 0, 0));
     if LAST_USED.swap(used, Ordering::Relaxed) == used
         && LAST_FREE.swap(free, Ordering::Relaxed) == free
         && LAST_MAX.swap(max_used, Ordering::Relaxed) == max_used
+        && LAST_CACHE.swap(cache_entries as u64, Ordering::Relaxed) == cache_entries as u64
     {
         return;
     }
+    let (b0, b1, b2, b3, b4, b5) = (buckets[0], buckets[1], buckets[2], buckets[3], buckets[4], buckets[5]);
     println!(
-        "[MEM] t={}s total={total} used={used} maxUsed={max_used} free={free} largest={largest} kB",
+        "[MEM] t={}s total={total} used={used} maxUsed={max_used} free={free} largest={largest} kB blk=lt64:{b0} 64-256:{b1} 256-1K:{b2} 1K-4K:{b3} 4K-16K:{b4} gt16K:{b5} cache={cache_entries}/{cache_capacity} gen={cache_gen}",
         uptime_millis() / 1000
     );
 }
@@ -826,13 +841,13 @@ impl slint::platform::Platform for BluekernelBackend {
         loop {
             slint::platform::update_timers_and_animations();
 
-            let now_ms = uptime_millis();
-            if now_ms.saturating_sub(last_mem_snap_ms) >= MEM_SNAP_INTERVAL_MS {
-                last_mem_snap_ms = now_ms;
-                log_mem_snapshot();
-            }
-
             if let Some(window) = self.window.borrow().clone() {
+                let now_ms = uptime_millis();
+                if now_ms.saturating_sub(last_mem_snap_ms) >= MEM_SNAP_INTERVAL_MS {
+                    last_mem_snap_ms = now_ms;
+                    log_mem_snapshot(Some(&window));
+                }
+
                 // Dispatch input before drawing so its visual state is visible
                 // in this iteration instead of one event-loop cycle later.
                 if let Some(touch) = touch.as_mut() {
