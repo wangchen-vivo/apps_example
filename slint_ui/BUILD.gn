@@ -84,7 +84,7 @@ reload_autoconf_and_build("slint_ui_example") {
     "src/audio.rs",
     "src/audio_pcm_short.rs",
     "src/text_pages.rs",
-    "assets/text-metrics.rs",
+    "resources/text-metrics.rs",
   ]
   rustenv = [ "SLINT_UI_GENERATED=" + rebase_path(_slint_ui_generated) ]
   deps = [

@@ -19,7 +19,7 @@
 //! for glyph overhang.
 
 mod metrics {
-    include!("../assets/text-metrics.rs");
+    include!("../resources/text-metrics.rs");
 }
 
 const FONT_SIZE: u32 = 20;
