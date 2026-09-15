@@ -35,7 +35,7 @@ const COMMIT_MARKER: u32 = 0x434f_4d4d;
 const COMMIT_OFFSET: usize = 24;
 /// The writer thread's locals are three 4 KiB buffers plus the journal; 32 KiB
 /// gives headroom without stressing the heap-backed thread stacks.
-const FLASH_THREAD_STACK_SIZE: usize = 32 * 1024;
+const FLASH_THREAD_STACK_SIZE: usize = 16 * 1024;
 
 // Playback state shared between the writer thread (producer) and the UI
 // thread (consumer). MainWindow is !Send, so the writer thread cannot touch

@@ -24,6 +24,7 @@ use librs::c_str::CStr;
 use librs::syscall::Syscall;
 use slint::{ComponentHandle, Model};
 use std::cell::RefCell;
+use std::fmt::Write as _;
 use std::io::{Error, ErrorKind, Result as IoResult};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -32,14 +33,29 @@ use std::sync::Mutex;
 const POLL_MS: u64 = 500; // 2 Hz CPU/mem refresh rate
 const TASK_POLL_MS: u64 = 2000; // task list refresh rate (5x less churn)
 const CORE_COUNT: usize = 1; // ESP32-C6 is single-core RISC-V
-const MAX_TASK_LINES: usize = 8;
-const WORKER_STACK_SIZE: usize = 8 * 1024;
+                             // Six compact rows keep the complete page below the renderer's 256-command
+                             // growth boundary; crossing it requests one contiguous 14336-byte block.
+const MAX_TASK_LINES: usize = 6;
+const TASK_NAME_BYTES: usize = 6;
+/// Upper bound on kernel threads surfaced by /proc/0/task. The board runs
+/// ~10 threads; 32 leaves headroom while keeping the snapshot a single
+/// static block instead of a growable heap Vec.
+const MAX_TASKS: usize = 32;
+// Release ELF: worker_loop uses a 2496-byte direct frame. 6 KiB leaves room
+// for procfs/syscall call chains without keeping an 8-KiB stack resident.
+const WORKER_STACK_SIZE: usize = 6 * 1024;
 
 /// Snapshot of CPU idle/system ticks for computing delta usage.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 struct CpuTickSnapshot {
     idle: u64,
     system: u64,
+}
+
+impl CpuTickSnapshot {
+    const fn zeroed() -> Self {
+        Self { idle: 0, system: 0 }
+    }
 }
 
 /// Parse a single "cpuN  ..." line from /proc/stat.
@@ -52,37 +68,26 @@ fn parse_cpu_stat_line(line: &str) -> Option<(usize, u64, u64)> {
     let rest = line.strip_prefix("cpu")?;
     let (id_str, values) = rest.split_once(' ')?;
     let cpu_id = id_str.parse::<usize>().ok()?;
-    let parts: Vec<u64> = values
+    // Pull the tick values with an iterator instead of a temporary Vec.
+    let mut vals = values
         .split_whitespace()
-        .filter_map(|s| s.parse::<u64>().ok())
-        .collect();
-    if parts.len() < 5 {
-        return None;
-    }
-    // user, nice, system, idle, iowait, irq, softirq, ...
-    let user = parts[0];
-    let nice = parts[1];
-    let system = parts[2];
-    let idle = parts[3];
-    let total = user + nice + system + idle + parts.iter().skip(4).sum::<u64>();
+        .filter_map(|s| s.parse::<u64>().ok());
+    let (user, nice, system, idle) = (vals.next()?, vals.next()?, vals.next()?, vals.next()?);
+    let total = user + nice + system + idle + vals.sum::<u64>();
     Some((cpu_id, idle, total))
 }
 
 /// Parse /proc/stat content and return per-core idle/total tick snapshots.
-fn parse_proc_stat(content: &[u8]) -> Vec<CpuTickSnapshot> {
+fn parse_proc_stat(content: &[u8]) -> [CpuTickSnapshot; CORE_COUNT] {
     let text = core::str::from_utf8(content).unwrap_or("");
-    let mut snaps: Vec<CpuTickSnapshot> = Vec::with_capacity(CORE_COUNT);
+    let mut snaps = [CpuTickSnapshot::zeroed(); CORE_COUNT];
     for line in text.lines() {
         if let Some((cpu_id, idle, total)) = parse_cpu_stat_line(line) {
             if cpu_id < CORE_COUNT {
-                snaps.push(CpuTickSnapshot {
+                snaps[cpu_id] = CpuTickSnapshot {
                     idle,
-                    ..Default::default()
-                });
-                // Store total in the system field (reuse field)
-                if let Some(entry) = snaps.last_mut() {
-                    entry.system = total;
-                }
+                    system: total,
+                };
             }
         }
     }
@@ -110,12 +115,10 @@ fn parse_proc_meminfo(content: &[u8]) -> (f32, f32, f32) {
 
 /// Extract the numeric kB value from a line like "MemTotal: 1234 kB".
 fn parse_kb_value(line: &str) -> f32 {
-    let parts: Vec<&str> = line.split_whitespace().collect();
-    if parts.len() >= 2 {
-        parts[1].parse::<f32>().unwrap_or(0.0)
-    } else {
-        0.0
-    }
+    line.split_whitespace()
+        .nth(1)
+        .and_then(|value| value.parse::<f32>().ok())
+        .unwrap_or(0.0)
 }
 
 /// Parse /proc/cpuinfo. Returns (uarch, isa, mhz_text) or defaults on failure.
@@ -151,13 +154,13 @@ fn parse_cpuinfo(content: &[u8]) -> (String, String, String) {
     (uarch, isa, format!("{} MHz", mhz))
 }
 
-/// Parse a thread status file from /proc/<tid>/status.
-fn parse_thread_status(content: &[u8], tid: usize) -> (String, String, String, String, String) {
+/// Parse a thread status file from /proc/<tid>/status into a compact entry.
+fn parse_thread_status(content: &[u8], tid: usize) -> TaskEntry {
     let text = core::str::from_utf8(content).unwrap_or("");
     let mut name = "";
     let mut kind = "normal";
     let mut state = "unknown";
-    let mut priority = 0usize;
+    let mut priority = 0u32;
 
     for line in text.lines() {
         let line = line.trim();
@@ -168,53 +171,57 @@ fn parse_thread_status(content: &[u8], tid: usize) -> (String, String, String, S
         } else if let Some(val) = line.strip_prefix("State:") {
             state = val.trim();
         } else if let Some(val) = line.strip_prefix("Priority:") {
-            priority = val.trim().parse::<usize>().unwrap_or(0);
+            priority = val.trim().parse::<u32>().unwrap_or(0);
         }
     }
 
-    // State abbreviated to keep the per-frame glyph count low. The software
-    // renderer grows its glyph texture array from 256 to 512 entries the
-    // moment a frame exceeds 256 glyphs, and that 14336-byte allocation is
-    // the OOM point on this page. Short state/name strings keep 8 rows of
-    // 5 columns comfortably below 256 glyphs.
-    let state_abbr = match state {
-        "running" => "RUN",
-        "ready" => "RDY",
-        "suspended" => "SUSP",
-        "idle" => "IDLE",
-        "retired" => "RET",
-        _ => "?",
+    // State/kind map to enums; abbreviations are only materialized for the
+    // visible rows. Keeping glyph counts low is what keeps the software
+    // renderer below its 256-glyph texture-array growth point (a 14336-byte
+    // allocation that is the OOM point on this page).
+    let task_state = match state {
+        "running" => TaskState::Running,
+        "ready" => TaskState::Ready,
+        "suspended" => TaskState::Suspended,
+        "idle" => TaskState::Idle,
+        "retired" => TaskState::Retired,
+        _ => TaskState::Unknown,
     };
-
-    // Type column derives from the thread kind (four categories).
-    let type_abbr = match kind {
-        "idle" => "idle",
-        "normal" => "norm",
-        "async_poller" => "poll",
-        "soft_timer" => "timer",
-        _ => "norm",
+    let task_kind = match kind {
+        "idle" => TaskKind::Idle,
+        "async_poller" => TaskKind::AsyncPoller,
+        "soft_timer" => TaskKind::SoftTimer,
+        _ => TaskKind::Normal,
     };
 
     // Name column shows the custom name verbatim (empty falls back to kind),
-    // truncated so the longest row still stays under the glyph budget.
+    // truncated to the compact on-screen budget.
     let name_src = if name.is_empty() { kind } else { name };
-    let typed_name: String = name_src.chars().take(10).collect();
+    let mut name_buf = [0u8; TASK_NAME_BYTES];
+    let mut name_len = 0;
+    for (dst, byte) in name_buf
+        .iter_mut()
+        .zip(name_src.bytes().take(TASK_NAME_BYTES))
+    {
+        *dst = byte;
+        name_len += 1;
+    }
 
-    // TID: show last 4 hex digits
-    let tid_str = format!("{:04X}", tid & 0xFFFF);
-    let prio_str = format!("{}", priority);
-
-    (
-        tid_str,
-        type_abbr.to_string(),
-        state_abbr.to_string(),
-        prio_str,
-        typed_name,
-    )
+    TaskEntry {
+        tid: (tid & 0xFFFF) as u16,
+        priority: priority.min(u8::MAX as u32) as u8,
+        kind: task_kind,
+        state: task_state,
+        name: name_buf,
+        name_len,
+    }
 }
 
-/// Read the full content of a file (small, procfs-style).
-fn read_proc_file(path: &[u8]) -> IoResult<Vec<u8>> {
+/// Read a small procfs-style file into a fixed stack buffer, returning the
+/// buffer and its valid length. No heap allocation on the hot task-list
+/// path (the old per-read `to_vec` made ~1 KiB transient allocations for
+/// every one of the ~100 tasks every collection).
+fn read_proc_file(path: &[u8]) -> IoResult<([u8; 1024], usize)> {
     // Use from_bytes_until_nul to tolerate trailing zero bytes in the buffer.
     let c_path =
         CStr::from_bytes_until_nul(path).map_err(|_| Error::from_raw_os_error(libc::EINVAL))?;
@@ -232,7 +239,7 @@ fn read_proc_file(path: &[u8]) -> IoResult<Vec<u8>> {
         }
     };
     let _ = librs::syscall::sys::Sys::close(fd);
-    Ok(buf[..n].to_vec())
+    Ok((buf, n))
 }
 
 /// Build a null-terminated /proc/0/task/<tid>/status path.
@@ -268,7 +275,8 @@ fn path_for_task_status(tid: usize) -> [u8; 64] {
 /// List directory entries in /proc/0/task/ (each is a TID directory).
 /// The "0" pid is a placeholder — BlueOS does not have a process concept yet.
 /// Uses the kernel's dirent layout (which matches libc::dirent64 on 32-bit musl).
-fn list_task_entries() -> IoResult<Vec<usize>> {
+/// Returns a fixed array plus its valid length; no heap allocation.
+fn list_task_entries() -> IoResult<([usize; MAX_TASKS], usize)> {
     let path = CStr::from_bytes_with_nul(b"/proc/0/task\0")
         .map_err(|_| Error::from_raw_os_error(libc::EINVAL))?;
     let fd = librs::syscall::sys::Sys::open(path, libc::O_RDONLY | libc::O_DIRECTORY, 0);
@@ -278,7 +286,8 @@ fn list_task_entries() -> IoResult<Vec<usize>> {
 
     // Read directory entries using getdents
     let mut buf = [0u8; 512];
-    let mut tids = Vec::new();
+    let mut tids = [0usize; MAX_TASKS];
+    let mut tids_len = 0;
     loop {
         let n = match librs::syscall::sys::Sys::getdents(fd, &mut buf) {
             Ok(n) => n,
@@ -321,7 +330,10 @@ fn list_task_entries() -> IoResult<Vec<usize>> {
             if d_type == 4 && name_len > 0 && name_bytes[0] != b'.' {
                 if let Ok(name) = core::str::from_utf8(name_bytes) {
                     if let Ok(tid) = name.parse::<usize>() {
-                        tids.push(tid);
+                        if tids_len < MAX_TASKS {
+                            tids[tids_len] = tid;
+                            tids_len += 1;
+                        }
                     }
                 }
             }
@@ -332,17 +344,78 @@ fn list_task_entries() -> IoResult<Vec<usize>> {
     let _ = librs::syscall::sys::Sys::close(fd);
 
     // Sort by TID
-    tids.sort_unstable();
-    Ok(tids)
+    tids[..tids_len].sort_unstable();
+    Ok((tids, tids_len))
 }
 
-#[derive(Clone)]
+/// Compact per-task snapshot: fixed-size fields instead of five heap
+/// Strings, so the ~100-entry task list is one ~2 KiB block instead of a
+/// 7.5 KiB Vec plus hundreds of small allocations. Display strings are
+/// formatted only for the visible rows in copy_task_window.
+#[derive(Clone, Copy)]
 struct TaskEntry {
-    tid_disp: String,
-    type_abbr: String,
-    state_abbr: String,
-    prio_str: String,
-    typed_name: String,
+    tid: u16,
+    priority: u8,
+    kind: TaskKind,
+    state: TaskState,
+    name: [u8; TASK_NAME_BYTES],
+    name_len: u8,
+}
+
+impl TaskEntry {
+    /// Zeroed placeholder used to back the static snapshot array.
+    const fn placeholder() -> Self {
+        Self {
+            tid: 0,
+            priority: 0,
+            kind: TaskKind::Normal,
+            state: TaskState::Unknown,
+            name: [0u8; TASK_NAME_BYTES],
+            name_len: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum TaskKind {
+    Idle,
+    Normal,
+    AsyncPoller,
+    SoftTimer,
+}
+
+impl TaskKind {
+    fn abbr(self) -> &'static str {
+        match self {
+            TaskKind::Idle => "idle",
+            TaskKind::Normal => "norm",
+            TaskKind::AsyncPoller => "poll",
+            TaskKind::SoftTimer => "timer",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum TaskState {
+    Running,
+    Ready,
+    Suspended,
+    Idle,
+    Retired,
+    Unknown,
+}
+
+impl TaskState {
+    fn abbr(self) -> &'static str {
+        match self {
+            TaskState::Running => "RUN",
+            TaskState::Ready => "RDY",
+            TaskState::Suspended => "SUSP",
+            TaskState::Idle => "IDLE",
+            TaskState::Retired => "RET",
+            TaskState::Unknown => "?",
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -363,46 +436,47 @@ static CPU_MHZ: Mutex<String> = Mutex::new(String::new());
 /// Publish flags — set once when the worker has valid data.
 static CPUINFO_READY: AtomicBool = AtomicBool::new(false);
 /// Full task list, sorted by state (running/ready/other), published by the
-/// worker. The UI thread locks it briefly to slice the visible window.
-static TASK_ENTRIES: Mutex<Vec<TaskEntry>> = Mutex::new(Vec::new());
+/// worker. Fixed-size so the snapshot never needs a heap allocation; the
+/// valid length lives in TASK_TOTAL. The UI thread locks it briefly to
+/// slice the visible window.
+static TASK_ENTRIES: Mutex<[TaskEntry; MAX_TASKS]> =
+    Mutex::new([TaskEntry::placeholder(); MAX_TASKS]);
 static TASK_TOTAL: AtomicUsize = AtomicUsize::new(0);
+static TASK_VERSION: AtomicU32 = AtomicU32::new(0);
 /// Worker state for CPU delta calculation.
-static PREV_TICKS: Mutex<Vec<CpuTickSnapshot>> = Mutex::new(Vec::new());
+static PREV_TICKS: Mutex<[CpuTickSnapshot; CORE_COUNT]> =
+    Mutex::new([CpuTickSnapshot::zeroed(); CORE_COUNT]);
 static FIRST_STAT: AtomicBool = AtomicBool::new(true);
 /// Set true while the worker thread should keep running. The worker is
-/// spawned when the sched-mon page is entered and stopped when it is left,
-/// so the 16 KiB thread stack is only held while the page is on screen.
+/// spawned when the sched-mon page is entered and exits when it is left.
 static WORKER_RUNNING: AtomicBool = AtomicBool::new(false);
 static WORKER_SPAWNED: AtomicBool = AtomicBool::new(false);
 
 /// Start the background collector (called when the page is entered). The
-/// thread is spawned once for the whole process and parked on the gate
-/// between visits; subsequent entries just re-open the gate.
+/// worker is finite so its stack is returned after every page exit.
 fn start_worker() {
-    if WORKER_RUNNING.swap(true, Ordering::Relaxed) {
+    if WORKER_RUNNING.swap(true, Ordering::AcqRel) {
         return;
     }
-    if !WORKER_SPAWNED.swap(true, Ordering::Relaxed) {
+    if !WORKER_SPAWNED.swap(true, Ordering::AcqRel) {
         match std::thread::Builder::new()
             .stack_size(WORKER_STACK_SIZE)
             .spawn(worker_loop)
         {
-            Ok(_) => {}
+            Ok(worker) => drop(worker),
             Err(error) => {
-                WORKER_SPAWNED.store(false, Ordering::Relaxed);
-                WORKER_RUNNING.store(false, Ordering::Relaxed);
+                WORKER_SPAWNED.store(false, Ordering::Release);
+                WORKER_RUNNING.store(false, Ordering::Release);
                 println!("[SCHED_MON] worker spawn failed: {error}");
             }
         }
     }
 }
 
-/// Stop the worker (page left): close the gate and let the thread park.
-/// The thread and its stack stay alive and resume on the next visit, so no
-/// per-visit spawn/teardown heap churn accumulates. Shared buffers keep
-/// their capacity and are overwritten on the next entry.
+/// Stop the worker (page left). It notices this flag within one poll interval,
+/// returns, and BlueOS releases its complete 6-KiB pthread allocation.
 fn stop_worker() {
-    if !WORKER_RUNNING.swap(false, Ordering::Relaxed) {
+    if !WORKER_RUNNING.swap(false, Ordering::AcqRel) {
         return;
     }
     TASK_TOTAL.store(0, Ordering::Relaxed);
@@ -410,20 +484,19 @@ fn stop_worker() {
     MEM_TOTAL_KB.store(0, Ordering::Relaxed);
     MEM_USED_KB.store(0, Ordering::Relaxed);
     MEM_MAX_USED_KB.store(0, Ordering::Relaxed);
-    CPUINFO_READY.store(false, Ordering::Relaxed);
 }
 
 /// One full worker pass: read + parse every proc file, publish results.
 fn worker_pass() {
     // ---- CPU usage ----
-    if let Ok(stat_content) = read_proc_file(b"/proc/stat\0") {
-        let current_ticks = parse_proc_stat(&stat_content);
+    if let Ok((stat_buf, stat_len)) = read_proc_file(b"/proc/stat\0") {
+        let current_ticks = parse_proc_stat(&stat_buf[..stat_len]);
         let mut prev = match PREV_TICKS.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
         let first = FIRST_STAT.swap(false, Ordering::Relaxed);
-        if !first && current_ticks.len() == prev.len() {
+        if !first {
             let d_total = current_ticks[0].system.saturating_sub(prev[0].system);
             let d_idle = current_ticks[0].idle.saturating_sub(prev[0].idle);
             let pct = if d_total > 0 {
@@ -437,8 +510,8 @@ fn worker_pass() {
     }
 
     // ---- Memory usage ----
-    if let Ok(mem_content) = read_proc_file(b"/proc/meminfo\0") {
-        let (total, used, max_used) = parse_proc_meminfo(&mem_content);
+    if let Ok((mem_buf, mem_len)) = read_proc_file(b"/proc/meminfo\0") {
+        let (total, used, max_used) = parse_proc_meminfo(&mem_buf[..mem_len]);
         MEM_TOTAL_KB.store(total as i32, Ordering::Relaxed);
         MEM_USED_KB.store(used as i32, Ordering::Relaxed);
         MEM_MAX_USED_KB.store(max_used as i32, Ordering::Relaxed);
@@ -446,8 +519,8 @@ fn worker_pass() {
 
     // ---- CPU info (static-ish; only the MHz line changes) ----
     if !CPUINFO_READY.load(Ordering::Relaxed) {
-        if let Ok(c) = read_proc_file(b"/proc/cpuinfo\0") {
-            let (uarch, isa, mhz_text) = parse_cpuinfo(&c);
+        if let Ok((cpu_buf, cpu_len)) = read_proc_file(b"/proc/cpuinfo\0") {
+            let (uarch, isa, mhz_text) = parse_cpuinfo(&cpu_buf[..cpu_len]);
             if let Ok(mut m) = CPU_MODEL.lock() {
                 *m = uarch;
             }
@@ -465,67 +538,104 @@ fn worker_pass() {
 /// Collect + publish the task list snapshot. Kept separate from the CPU/mem
 /// pass so it can run on a slower cadence and reduce heap churn.
 fn worker_collect_tasks() {
-    let tids = match list_task_entries() {
-        Ok(tids) => tids,
+    let (tids, tids_len) = match list_task_entries() {
+        Ok(result) => result,
         Err(_) => return,
     };
-    // Build directly into the shared buffer (clear + push) so the ≈14 KiB
-    // snapshot is never duplicated as a local Vec while the shared one is
-    // alive. The UI thread slices rows under the same lock, so holding it
-    // across the reads is safe and blocks only a shallow window copy.
+    // Build directly into the shared fixed array so the snapshot never
+    // allocates. The UI thread slices rows under the same lock, so holding
+    // it across the reads is safe and blocks only a shallow window copy.
     let mut entries = match TASK_ENTRIES.lock() {
         Ok(g) => g,
         Err(p) => p.into_inner(),
     };
-    entries.clear();
-    for &tid in tids.iter() {
+    let count = tids_len.min(MAX_TASKS);
+    for i in 0..count {
+        let tid = tids[i];
         let path = path_for_task_status(tid);
-        let (tid_str, type_abbr, state_abbr, prio_str, typed_name) =
-            if let Ok(content) = read_proc_file(&path) {
-                parse_thread_status(&content, tid)
-            } else {
-                (
-                    format!("{:04X}", tid & 0xFFFF),
-                    "?".into(),
-                    "?".into(),
-                    "?".into(),
-                    "?".into(),
-                )
-            };
-        entries.push(TaskEntry {
-            tid_disp: tid_str,
-            type_abbr,
-            state_abbr,
-            prio_str,
-            typed_name,
-        });
+        let entry = if let Ok((status_buf, status_len)) = read_proc_file(&path) {
+            parse_thread_status(&status_buf[..status_len], tid)
+        } else {
+            TaskEntry {
+                tid: (tid & 0xFFFF) as u16,
+                priority: 0,
+                kind: TaskKind::Normal,
+                state: TaskState::Unknown,
+                name: [0u8; TASK_NAME_BYTES],
+                name_len: 0,
+            }
+        };
+        entries[i] = entry;
     }
 
-    // Sort: running first, then ready, then others; stable to preserve TID order for ties.
-    entries.sort_by_key(|e| match e.state_abbr.as_str() {
-        "RUN" => 0,
-        "RDY" => 1,
-        _ => 2,
+    // Include TID in the key for deterministic ordering while using the
+    // allocation-free unstable sorter.
+    entries[..count].sort_unstable_by_key(|e| {
+        let state_order = match e.state {
+            TaskState::Running => 0,
+            TaskState::Ready => 1,
+            _ => 2,
+        };
+        (state_order, e.tid)
     });
 
     // The shared buffer is already filled and sorted; just update the count.
     drop(entries);
-    TASK_TOTAL.store(tids.len(), Ordering::Relaxed);
+    TASK_TOTAL.store(count, Ordering::Relaxed);
+    TASK_VERSION.fetch_add(1, Ordering::Release);
 }
 
-/// Worker entry: thread lives for the whole process lifetime and parks on
-/// the WORKER_RUNNING gate between page visits, so no per-visit spawn/drop
-/// heap churn accumulates. The inner loop runs one full pass and sleeps; on
-/// page leave the gate drops and the thread parks until the next visit.
+/// Small stack-backed formatter used for the five visible task columns. It
+/// avoids temporary heap Strings; converting to SharedString is the only
+/// allocation, and that value is retained directly by Slint.
+struct FixedText<const N: usize> {
+    bytes: [u8; N],
+    len: usize,
+}
+
+impl<const N: usize> FixedText<N> {
+    const fn new() -> Self {
+        Self {
+            bytes: [0; N],
+            len: 0,
+        }
+    }
+
+    fn push_byte(&mut self, byte: u8) {
+        if self.len < N {
+            self.bytes[self.len] = byte;
+            self.len += 1;
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        // All inputs are validated ASCII task fields or formatting output.
+        core::str::from_utf8(&self.bytes[..self.len]).unwrap_or("")
+    }
+}
+
+impl<const N: usize> core::fmt::Write for FixedText<N> {
+    fn write_str(&mut self, text: &str) -> core::fmt::Result {
+        let remaining = N.saturating_sub(self.len);
+        if text.len() > remaining {
+            return Err(core::fmt::Error);
+        }
+        self.bytes[self.len..self.len + text.len()].copy_from_slice(text.as_bytes());
+        self.len += text.len();
+        Ok(())
+    }
+}
+
+/// Worker entry. The small hand-off at the bottom prevents a lost wake-up
+/// when the user re-enters while the previous worker is just exiting.
 fn worker_loop() {
     loop {
-        while !WORKER_RUNNING.load(Ordering::Relaxed) {
-            librs::time::msleep(POLL_MS as libc::c_uint);
-        }
         FIRST_STAT.store(true, Ordering::Relaxed);
-        PREV_TICKS.lock().map(|mut g| g.clear());
+        PREV_TICKS
+            .lock()
+            .map(|mut g| *g = [CpuTickSnapshot::zeroed(); CORE_COUNT]);
         let mut passes_since_tasks = u32::MAX; // collect on the first pass
-        while WORKER_RUNNING.load(Ordering::Relaxed) {
+        while WORKER_RUNNING.load(Ordering::Acquire) {
             worker_pass();
             if passes_since_tasks >= (TASK_POLL_MS / POLL_MS) as u32 {
                 worker_collect_tasks();
@@ -534,6 +644,17 @@ fn worker_loop() {
                 passes_since_tasks += 1;
             }
             librs::time::msleep(POLL_MS as libc::c_uint);
+        }
+
+        WORKER_SPAWNED.store(false, Ordering::Release);
+        if !WORKER_RUNNING.load(Ordering::Acquire) {
+            return;
+        }
+        if WORKER_SPAWNED
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
         }
     }
 }
@@ -546,6 +667,8 @@ struct SchedMonitor {
     /// only the 9th.
     page_index: usize,
     total_tasks: usize,
+    last_task_version: u32,
+    task_dirty: bool,
 }
 
 impl SchedMonitor {
@@ -553,6 +676,8 @@ impl SchedMonitor {
         Self {
             page_index: 0,
             total_tasks: 0,
+            last_task_version: u32::MAX,
+            task_dirty: true,
         }
     }
 
@@ -569,20 +694,23 @@ impl SchedMonitor {
     fn scroll_down(&mut self) {
         // swipe-down → previous page
         self.page_index = self.page_index.saturating_sub(1);
+        self.task_dirty = true;
     }
 
     fn scroll_up(&mut self) {
         // swipe-up → next page, clamped to the last page.
         if self.page_index + 1 < self.page_count() {
             self.page_index += 1;
+            self.task_dirty = true;
         }
     }
 
     /// Copy the latest worker-published task snapshot window into the Slint
     /// models, in place. Only changed rows dirty the scene. Each of the 5
-    /// columns is formatted as an 8-line string so the page uses 5 Text scene
+    /// columns is formatted as a 6-line string so the page uses 5 Text scene
     /// items total instead of 40 cells.
     fn copy_task_window(&mut self, ui: &MainWindow) {
+        let copied_version = TASK_VERSION.load(Ordering::Acquire);
         self.total_tasks = TASK_TOTAL.load(Ordering::Relaxed);
 
         let snapshot = match TASK_ENTRIES.lock() {
@@ -590,51 +718,57 @@ impl SchedMonitor {
             Err(p) => p.into_inner(),
         };
         let offset = self.page_index * MAX_TASK_LINES;
+        let total = self.total_tasks.min(MAX_TASKS);
 
-        let mut tid_col = String::new();
-        let mut type_col = String::new();
-        let mut state_col = String::new();
-        let mut prio_col = String::new();
-        let mut name_col = String::new();
+        let mut tid_col = FixedText::<32>::new();
+        let mut type_col = FixedText::<36>::new();
+        let mut state_col = FixedText::<32>::new();
+        let mut prio_col = FixedText::<24>::new();
+        let mut name_col = FixedText::<44>::new();
         let mut row = 0;
-        for entry in snapshot.iter().skip(offset).take(MAX_TASK_LINES) {
+        for entry in snapshot[..total].iter().skip(offset).take(MAX_TASK_LINES) {
             if row > 0 {
-                tid_col.push('\n');
-                type_col.push('\n');
-                state_col.push('\n');
-                prio_col.push('\n');
-                name_col.push('\n');
+                tid_col.push_byte(b'\n');
+                type_col.push_byte(b'\n');
+                state_col.push_byte(b'\n');
+                prio_col.push_byte(b'\n');
+                name_col.push_byte(b'\n');
             }
-            tid_col.push_str(&entry.tid_disp);
-            type_col.push_str(&entry.type_abbr);
-            state_col.push_str(&entry.state_abbr);
-            prio_col.push_str(&entry.prio_str);
-            name_col.push_str(&entry.typed_name);
+            let _ = write!(tid_col, "{:04X}", entry.tid);
+            let _ = type_col.write_str(entry.kind.abbr());
+            let _ = state_col.write_str(entry.state.abbr());
+            let _ = write!(prio_col, "{}", entry.priority);
+            let _ = name_col.write_str(
+                core::str::from_utf8(&entry.name[..entry.name_len as usize]).unwrap_or("?"),
+            );
             row += 1;
         }
         drop(snapshot);
 
         while row < MAX_TASK_LINES {
-            tid_col.push('\n');
-            type_col.push('\n');
-            state_col.push('\n');
-            prio_col.push('\n');
-            name_col.push('\n');
+            tid_col.push_byte(b'\n');
+            type_col.push_byte(b'\n');
+            state_col.push_byte(b'\n');
+            prio_col.push_byte(b'\n');
+            name_col.push_byte(b'\n');
             row += 1;
         }
 
-        ui.set_task_col_tid(tid_col.into());
-        ui.set_task_col_type(type_col.into());
-        ui.set_task_col_state(state_col.into());
-        ui.set_task_col_prio(prio_col.into());
-        ui.set_task_col_name(name_col.into());
+        ui.set_task_col_tid(tid_col.as_str().into());
+        ui.set_task_col_type(type_col.as_str().into());
+        ui.set_task_col_state(state_col.as_str().into());
+        ui.set_task_col_prio(prio_col.as_str().into());
+        ui.set_task_col_name(name_col.as_str().into());
         ui.set_task_hidden(
             self.total_tasks
-                .saturating_sub(self.page_index * MAX_TASK_LINES + MAX_TASK_LINES) as i32,
+                .saturating_sub(self.page_index * MAX_TASK_LINES + MAX_TASK_LINES)
+                as i32,
         );
         ui.set_task_total(self.total_tasks as i32);
         ui.set_task_page(self.page() as i32);
         ui.set_task_page_count(self.page_count() as i32);
+        self.last_task_version = copied_version;
+        self.task_dirty = false;
     }
 
     /// UI-side tick: copy the worker's latest data into Slint models.
@@ -646,14 +780,21 @@ impl SchedMonitor {
         }
 
         // ---- Task list ----
-        self.copy_task_window(ui);
+        let task_version = TASK_VERSION.load(Ordering::Acquire);
+        if self.task_dirty || task_version != self.last_task_version {
+            self.copy_task_window(ui);
+        }
 
         // ---- CPU usage ----
         let pct = CPU_PCT.load(Ordering::Relaxed) as f32;
-        let old_pct = ui.get_cpu_usage_percent().row_data(0).unwrap_or(0.0);
+        let cpu_model = ui.get_cpu_usage_percent();
+        let old_pct = cpu_model.row_data(0).unwrap_or(0.0);
         if (pct - old_pct).abs() > 0.5 {
-            let model = slint::ModelRc::new(slint::VecModel::from(vec![pct]));
-            ui.set_cpu_usage_percent(model);
+            if let Some(model) = cpu_model.as_any().downcast_ref::<slint::VecModel<f32>>() {
+                model.set_row_data(0, pct);
+            } else {
+                ui.set_cpu_usage_percent(slint::ModelRc::new(slint::VecModel::from(vec![pct])));
+            }
         }
         ui.set_cpu_cores(CORE_COUNT as i32);
 
@@ -736,12 +877,13 @@ pub(crate) fn install(ui: &MainWindow) -> slint::Timer {
 
     let timer = slint::Timer::default();
     let timer_ui = ui.as_weak();
+    let timer_monitor = monitor.clone();
     timer.start(
         slint::TimerMode::Repeated,
         std::time::Duration::from_millis(POLL_MS),
         move || {
             if let Some(ui) = timer_ui.upgrade() {
-                let mut mon = monitor.borrow_mut();
+                let mut mon = timer_monitor.borrow_mut();
                 mon.tick(&ui);
             }
         },
@@ -749,14 +891,26 @@ pub(crate) fn install(ui: &MainWindow) -> slint::Timer {
 
     let page_active = std::rc::Rc::new(std::cell::Cell::new(false));
     let active_state = page_active.clone();
+    let active_monitor = monitor.clone();
+    let active_ui = ui.as_weak();
     ui.on_sched_mon_active_changed(move |active| {
         if active_state.replace(active) == active {
             return;
         }
+        active_monitor.borrow_mut().task_dirty = true;
         if active {
             start_worker();
         } else {
             stop_worker();
+            if let Some(ui) = active_ui.upgrade() {
+                // Drop the five SharedString payloads retained by Slint while
+                // this page is hidden. Empty SharedString has no text buffer.
+                ui.set_task_col_tid("".into());
+                ui.set_task_col_type("".into());
+                ui.set_task_col_state("".into());
+                ui.set_task_col_prio("".into());
+                ui.set_task_col_name("".into());
+            }
         }
         println!("[PAGE] {} sched-mon", if active { "enter" } else { "exit" });
     });

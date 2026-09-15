@@ -20,7 +20,9 @@ use std::cell::RefCell;
 use std::io::{Error, ErrorKind, Result as IoResult};
 use std::rc::Rc;
 
-const SCAN_POLL_ATTEMPTS: usize = 25;
+// A passive 13-channel scan listens for beacons for up to about four seconds.
+// Keep an eight-second polling window for driver/scheduler latency.
+const SCAN_POLL_ATTEMPTS: usize = 40;
 const SCAN_POLL_INTERVAL_MS: u128 = 200;
 const INITIAL_SCAN_DELAY_MS: u128 = 400;
 const SCAN_BUFFER_SIZE: usize = 2048;
@@ -111,7 +113,9 @@ fn wlan0_name() -> [libc::c_char; 16] {
 
 fn trigger_wifi_scan(fd: libc::c_int) -> IoResult<()> {
     let scan_req = libc::iw_scan_req {
-        scan_type: libc::IW_SCAN_TYPE_ACTIVE as u8,
+        // Passive scanning sees periodic beacons and is substantially more
+        // reliable than repeated wildcard probe requests in a busy RF area.
+        scan_type: libc::IW_SCAN_TYPE_PASSIVE as u8,
         essid_len: 0,
         num_channels: 0,
         flags: 0,
@@ -319,7 +323,10 @@ impl WifiScanner {
     fn new() -> Self {
         Self {
             socket: None,
-            scan_buffer: vec![0u8; SCAN_BUFFER_SIZE],
+            // Allocate the ioctl buffer only while a page-triggered scan is
+            // active. Two KiB matters on this target and need not live for
+            // the whole application lifetime.
+            scan_buffer: Vec::new(),
             state: WifiScanState::Idle,
             scan_requested: false,
             scan_not_before: 0,
@@ -329,6 +336,30 @@ impl WifiScanner {
             scroll_offset: 0,
             total_count: 0,
         }
+    }
+
+    fn clear_results(&mut self, ui: &MainWindow) {
+        // Assignment (instead of Vec::clear) releases both the elements and
+        // the retained allocation capacity.
+        self.results = Vec::new();
+        self.scroll_offset = 0;
+        self.total_count = 0;
+
+        // A VecModel retains its backing Vec after rows are removed. Replace
+        // it so the six rows and their three SharedStrings are really freed.
+        ui.set_networks(slint::ModelRc::new(slint::VecModel::default()));
+        ui.set_result_count(0);
+        ui.set_wifi_current_page(0);
+        ui.set_wifi_total_pages(0);
+        ui.set_status_text("".into());
+    }
+
+    fn release_scan_resources(&mut self) {
+        // Dropping SocketFd closes the ioctl socket and releases its
+        // kernel-side socket buffers. Replacing the Vec releases its 2-KiB
+        // allocation rather than retaining capacity for the next scan.
+        self.socket = None;
+        self.scan_buffer = Vec::new();
     }
 
     fn show_page(&self, ui: &MainWindow) {
@@ -386,9 +417,13 @@ impl WifiScanner {
                 ui.set_scanning(true);
                 ui.set_status_text("正在准备无线扫描".into());
             }
-        } else if matches!(self.state, WifiScanState::Idle) {
+        } else {
             self.scan_requested = false;
             ui.set_scanning(false);
+            self.clear_results(ui);
+            if matches!(self.state, WifiScanState::Idle) {
+                self.release_scan_resources();
+            }
         }
     }
 
@@ -405,11 +440,23 @@ impl WifiScanner {
 
     fn finish_scan(&mut self, ui: &MainWindow, result: IoResult<WifiScanResults>) {
         self.state = WifiScanState::Idle;
+        // The socket is needed only until SIOCGIWSCAN returns. Release it
+        // before constructing/updating Slint rows to reduce peak overlap.
+        self.release_scan_resources();
         if let Some(started_at) = self.scan_started_at.take() {
             println!(
                 "[WIFI_SCAN] completed elapsed_ms={}",
                 uptime_millis().saturating_sub(started_at)
             );
+        }
+        if !self.page_active {
+            // The user left while the driver scan was outstanding. Discard
+            // the late result instead of recreating a hidden page model.
+            drop(result);
+            self.clear_results(ui);
+            ui.set_scanning(false);
+            println!("[WIFI_SCAN] discarded result after page exit");
+            return;
         }
         match result {
             Ok(results) => {
@@ -424,7 +471,7 @@ impl WifiScanner {
                 }
             }
             Err(error) => {
-                self.results.clear();
+                self.results = Vec::new();
                 self.total_count = 0;
                 replace_network_rows(ui, Vec::new());
                 ui.set_result_count(0);

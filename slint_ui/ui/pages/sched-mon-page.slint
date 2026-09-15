@@ -82,7 +82,7 @@ export component SchedMonPage inherits AppPage {
     Text { x: 216px; y: 212px; width: 56px;  height: 20px; text: "优先级"; color: Theme.muted-text; font-size: Theme.font-sm; font-weight: 700; vertical-alignment: center; }
     Text { x: 284px; y: 212px; width: 148px; height: 20px; text: "名称";   color: Theme.muted-text; font-size: Theme.font-sm; font-weight: 700; vertical-alignment: center; }
 
-    // Task rows — one Text per column, each column is an 8-line string
+    // Task rows — one Text per column, each column is a 6-line string
     // ("\n"-separated rows built in Rust). Column x-positions come from Slint
     // layout so values align regardless of font advance widths. 5 Text items
     // total (vs 40 cells) keeps the software renderer's scene allocation low.

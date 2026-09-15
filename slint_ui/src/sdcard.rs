@@ -523,6 +523,12 @@ pub(crate) fn install(ui: &MainWindow, png_state: SharedPngRenderState) {
             let mut s = png_state.borrow_mut();
             s.pending = None;
             s.active = false;
+            // Release the directory listing and row model; the SD card is
+            // static so a re-enter re-runs refresh() from the same root.
+            if let Some(ui) = ui_weak.upgrade() {
+                callback_browser.borrow_mut().entries.clear();
+                replace_entry_rows(&ui, Vec::new());
+            }
         }
         if active {
             if let Some(ui) = ui_weak.upgrade() {

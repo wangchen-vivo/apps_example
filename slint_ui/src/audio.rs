@@ -67,18 +67,18 @@ fn scan_sd_tracks() -> bool {
     let mut tracks = Vec::new();
     collect_wavs(std::path::Path::new(SD_SOUNDS_ROOT), &mut tracks);
     tracks.sort();
+    let track_count = tracks.len();
     SD_TRACKS.with(|slot| {
-        let mut current = slot.borrow_mut();
-        *current = tracks.clone();
+        *slot.borrow_mut() = tracks;
     });
     SD_TRACK_INDEX.with(|slot| {
-        if tracks.is_empty() {
+        if track_count == 0 {
             slot.set(0);
-        } else if slot.get() >= tracks.len() {
+        } else if slot.get() >= track_count {
             slot.set(0);
         }
     });
-    !tracks.is_empty()
+    track_count != 0
 }
 
 /// File name of the track at the current index, or empty when in built-in mode.
@@ -205,6 +205,9 @@ const RAW_CHUNK: usize = LJ_CHUNK / 8; // 511 samples × 2 bytes = 1022
 struct AudioPlayer {
     offset: usize,
     buf: Vec<u8>,
+    /// Reusable per-tick PCM buffer, cleared and refilled each 10 ms tick to
+    /// avoid a fresh allocation (and heap fragmentation) per chunk.
+    chunk_buf: Vec<u8>,
     /// Handle to /dev/i2s0 while playing.
     file: Option<std::fs::File>,
     /// Handle to the source WAV on the SD card (AudioSource::File only),
@@ -218,6 +221,7 @@ impl AudioPlayer {
         Self {
             offset: 0,
             buf: vec![0u8; LJ_CHUNK],
+            chunk_buf: Vec::new(),
             file: None,
             wav_file: None,
             source: AudioSource::Builtin,
@@ -291,49 +295,63 @@ fn playback_tick(ui: &MainWindow) {
         }
 
         let lj_len = (raw_len / 2) * 16;
-        // Copy PCM slice first to avoid borrowing player.buf while pcm borrows player.
+        // Fill the reusable per-tick buffer instead of allocating a fresh Vec
+        // every 10 ms; convert_to_lj then reads from it while player.buf is
+        // written, avoiding both a per-tick heap allocation and overlapping
+        // borrows of player.
+        let offset = player.offset;
         let is_file_source = matches!(player.source, AudioSource::File { .. });
-        if player.offset == 0 {
+        if offset == 0 {
             println!("[AUDIO] tick source={} is_file={}", player.source.label(), is_file_source);
         }
-        let pcm_chunk: Vec<u8> = if !is_file_source {
+        player.chunk_buf.clear();
+        if !is_file_source {
             let pcm = EXAMPLE_PCM.as_slice();
-            pcm[player.offset..player.offset + raw_len].to_vec()
-        } else if let Some(wav) = player.wav_file.as_mut() {
-            // Read up to raw_len bytes. The WAV header may declare a data
-            // size larger than the real file (e.g. padding), so accept a
-            // short read: reaching EOF ends playback instead of erroring.
-            let mut chunk = vec![0u8; raw_len];
-            let n = match wav.read(&mut chunk) {
-                Ok(n) => n,
-                Err(e) => {
-                    println!("[AUDIO] WAV read error at {}: {}", player.offset, e);
-                    set_status(ui, &player.source, format!("读取 WAV 失败: {}", e));
+            player
+                .chunk_buf
+                .extend_from_slice(&pcm[offset..offset + raw_len]);
+        } else {
+            // Take the WAV handle out so reads borrow it directly instead of
+            // overlapping with player.chunk_buf; it is put back afterwards.
+            let mut wav = player.wav_file.take();
+            if let Some(fw) = wav.as_mut() {
+                // Read up to raw_len bytes. The WAV header may declare a data
+                // size larger than the real file (e.g. padding), so accept a
+                // short read: reaching EOF ends playback instead of erroring.
+                player.chunk_buf.resize(raw_len, 0);
+                let n = match fw.read(&mut player.chunk_buf) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        println!("[AUDIO] WAV read error at {}: {}", offset, e);
+                        set_status(ui, &player.source, format!("读取 WAV 失败: {}", e));
+                        set_playing(ui, &player.source, false);
+                        drop(player.file.take());
+                        drop(wav);
+                        return;
+                    }
+                };
+                if n == 0 {
+                    println!("[AUDIO] playback done ({} bytes)", offset);
+                    set_status(ui, &player.source, "播放完成".to_string());
                     set_playing(ui, &player.source, false);
                     drop(player.file.take());
-                    drop(player.wav_file.take());
+                    drop(wav);
                     return;
                 }
-            };
-            if n == 0 {
-                println!("[AUDIO] playback done ({} bytes)", player.offset);
-                set_status(ui, &player.source, "播放完成".to_string());
+                player.chunk_buf.truncate(n);
+            } else {
+                set_status(ui, &player.source, "WAV 文件未打开".to_string());
                 set_playing(ui, &player.source, false);
                 drop(player.file.take());
-                drop(player.wav_file.take());
+                drop(wav);
                 return;
             }
-            chunk.truncate(n);
-            chunk
-        } else {
-            set_status(ui, &player.source, "WAV 文件未打开".to_string());
-            set_playing(ui, &player.source, false);
-            drop(player.file.take());
-            return;
-        };
-        let raw_len = pcm_chunk.len();
-        let lj_len = (raw_len / 2) * 16;
-        convert_to_lj(&pcm_chunk, &mut player.buf, 0, raw_len);
+            player.wav_file = wav;
+        }
+        let raw_len = player.chunk_buf.len();
+        let pcm = std::mem::take(&mut player.chunk_buf);
+        convert_to_lj(&pcm, &mut player.buf, 0, raw_len);
+        player.chunk_buf = pcm;
 
         // Split borrows: take file out, write, then put back.
         let mut file_opt = player.file.take();
