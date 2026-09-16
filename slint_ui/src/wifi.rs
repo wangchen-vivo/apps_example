@@ -497,7 +497,9 @@ impl WifiScanner {
     fn start_scan(&mut self, ui: &MainWindow, now: u128) {
         self.scan_requested = false;
         self.scan_started_at = Some(now);
-        self.scroll_offset = 0;
+        // Release the previous Rust and Slint result models before the driver
+        // starts allocating AP records for the new scan.
+        self.clear_results(ui);
         ui.set_scanning(true);
         ui.set_status_text("扫描信道 1 至 13".into());
         println!("[WIFI_SCAN] started");
