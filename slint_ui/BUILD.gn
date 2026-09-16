@@ -40,11 +40,9 @@ action("generate_slint_ui") {
     "ui/pages/text-viewer.slint",
     "ui/pages/image-viewer.slint",
     "ui/pages/audio-viewer.slint",
-    "ui/pages/wifi-scan-page.slint",
     "ui/pages/imu-page.slint",
     "ui/pages/battery-page.slint",
     "ui/pages/file-io-page.slint",
-    "ui/pages/metals-page.slint",
     "ui/pages/audio-page.slint",
     "ui/pages/power-page.slint",
     "resources/website-text.ttf",
@@ -75,7 +73,6 @@ reload_autoconf_and_build("slint_ui_example") {
     "src/brightness.rs",
     "src/battery.rs",
     "src/flash_io.rs",
-    "src/metals.rs",
     "src/png_view.rs",
     "src/sched_mon.rs",
     "src/sdcard.rs",
@@ -92,7 +89,6 @@ reload_autoconf_and_build("slint_ui_example") {
     "//external/vendor/libm-0.2.16:libm",
     "//external/vendor/png-0.18.1:png",
     "//external/vendor/slint-1.17.1:slint",
-    "//kernel/adapter/esp_radio_sys",
     "//kernel/kconfig:blueos_kconfig",
     "//kernel/rsrt:rsrt_std",
     "//libc",
@@ -101,47 +97,16 @@ reload_autoconf_and_build("slint_ui_example") {
   linker_script = default_linker_script
   configs = [ "//build/boards/${board}:kernel_config" ]
 
+  # Flash access, reset and delay routines live in the chip ROM linker map.
+  # This is board support, not the Wi-Fi driver; keep only this minimal native
+  # link input now that the ESP radio archives are no longer used.
   if (board == "esp32c6_devkitc_1") {
-    wifi_lib_dir = "//external/vendor/esp-wifi-sys-esp32c6-0.2.0/libs"
     rom_lib_dir = "//external/vendor/esp-rom-sys-0.1.4/ld/esp32c6"
-    bluetooth_lib = "-lble_app"
   } else {
-    wifi_lib_dir = "//external/vendor/esp-wifi-sys-esp32c3-0.2.0/libs"
     rom_lib_dir = "//external/vendor/esp-rom-sys-0.1.4/ld/esp32c3"
-    bluetooth_lib = "-lbtdm_app"
   }
-
-  wifi_ldflags = [
-    "-L" + rebase_path("${root_build_dir}/obj/external/vendor/esp-phy-0.2.0"),
-    "-L" + rebase_path("${root_build_dir}/obj/external/vendor/esp-radio-0.18.0"),
-    "-L" + rebase_path(wifi_lib_dir),
-    "-L" + rebase_path(rom_lib_dir),
-    "-L" + rebase_path("//external/vendor/esp-radio-0.18.0"),
-    "-L" + rebase_path("//external/vendor/esp-phy-0.2.0"),
-    "-lesp-phy",
-    "-lesp_rom_sys",
-    "-lbtbb",
-    bluetooth_lib,
-    "-lcoexist",
-    "-lespnow",
-    "-lmesh",
-    "-lnet80211",
-    "-lcore",
-    "-lsmartconfig",
-    "-lwapi",
-    "-lwpa_supplicant",
-    "-lregulatory",
-    "-lphy",
-    "-lpp",
-    # ESP Wi-Fi's libpp calls the C math function floor(). Keep libm after
-    # the vendor archives so the static linker can resolve that reference.
-    "-lm",
+  rustflags = [
+    "-Clink-arg=-L" + rebase_path(rom_lib_dir),
+    "-Clink-arg=-lesp_rom_sys",
   ]
-  if (board == "esp32c6_devkitc_1") {
-    wifi_ldflags += [ "-lprintf" ]
-  }
-  rustflags = []
-  foreach(item, wifi_ldflags) {
-    rustflags += [ "-Clink-arg=${item}" ]
-  }
 }

@@ -13,7 +13,6 @@
 // limitations under the License.
 
 #![feature(cfg_boolean_literals)]
-extern crate esp_radio_sys;
 extern crate libm;
 extern crate librs;
 extern crate png;
@@ -30,11 +29,9 @@ mod flash_io;
 mod imu;
 mod keys;
 mod math;
-mod metals;
 mod png_view;
 mod sched_mon;
 mod sdcard;
-mod wifi;
 
 use crate::app_window::MainWindow;
 use crate::background::PanelRgb565Pixel;
@@ -974,12 +971,10 @@ fn run_slint_ui() -> IoResult<()> {
     PNG_RENDER_STATE.with(|state| {
         sdcard::install(&ui, state.clone());
     });
-    let _wifi_scan_timer = wifi::install(&ui);
     let _battery_timer = battery::install(&ui);
     let _imu_timer = imu::install(&ui);
     let _sched_mon_timer = sched_mon::install(&ui);
     let _flash_io_timer = flash_io::install(&ui);
-    let _metals_timer = metals::install(&ui);
     let _brightness_timer = brightness::install(&ui);
     let _audio_timer = audio::install(&ui);
 

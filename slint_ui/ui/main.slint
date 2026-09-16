@@ -10,10 +10,8 @@ import { DemoPage } from "./pages/demo-page.slint";
 import { SchedMonPage } from "./pages/sched-mon-page.slint";
 import { ScreenColorPage } from "./pages/screen-color-page.slint";
 import { SdCardPage, SdFileEntry } from "./pages/sd-card-page.slint";
-import { WifiScanPage, WifiNetwork } from "./pages/wifi-scan-page.slint";
 import { ImuPage } from "./pages/imu-page.slint";
 import { FileIoPage } from "./pages/file-io-page.slint";
-import { MetalsPage } from "./pages/metals-page.slint";
 import { TouchPage } from "./pages/touch-page.slint";
 import { AudioPage } from "./pages/audio-page.slint";
 import { PowerPage } from "./pages/power-page.slint";
@@ -33,16 +31,6 @@ export component MainWindow inherits Window {
     property <float> tab-offset: 0.0;
     callback app-changed(int);
 
-    in property <[WifiNetwork]> networks;
-    in-out property <bool> scanning: false;
-    in-out property <int> result-count: 0;
-    in-out property <int> wifi-current-page: 0;
-    in-out property <int> wifi-total-pages: 0;
-    in-out property <string> status-text: "正在准备无线扫描";
-    callback scan-requested();
-    callback wifi-page-active-changed(bool);
-    callback wifi-scroll-up();
-    callback wifi-scroll-down();
     callback debug(string);
 
     in-out property <int> battery-percent: 0;
@@ -62,15 +50,6 @@ export component MainWindow inherits Window {
     in-out property <string> flash-status-text: "点按 START 写入并校验 Flash";
     callback flash-start-requested();
     callback flash-page-active-changed(bool);
-
-    // Gold & silver price page (metals.rs drives these).
-    in-out property <string> metals-time: "--:--";
-    in-out property <string> metals-xau: "--";
-    in-out property <string> metals-xag: "--";
-    in-out property <string> metals-status: "…";
-    in-out property <bool> metals-refreshing: false;
-    callback metals-refresh();
-    callback metals-active-changed(bool);
 
     in-out property <int> brightness: 100;
     callback set-brightness(int);
@@ -164,11 +143,9 @@ export component MainWindow inherits Window {
         root.app-changed(root.current-app);
         root.sched-mon-active-changed(root.current-app == 6);
         root.battery-active-changed(root.current-app == 7);
-        root.wifi-page-active-changed(root.current-app == 11);
         root.imu-page-active-changed(root.current-app == 12);
         root.sd-page-active-changed(root.current-app == 13);
         root.brightness-page-active-changed(root.current-app == 10);
-        root.metals-active-changed(root.current-app == 14);
         root.audio-page-active-changed(root.current-app == 15);
         root.flash-page-active-changed(root.current-app == 8);
         if root.current-app != 13 {
@@ -254,19 +231,6 @@ export component MainWindow inherits Window {
         go-back => { root.current-app = -1; } go-home => { root.current-app = -1; }
     }
     // 外设 demo pages
-    if current-app == 11: WifiScanPage {
-        networks: root.networks;
-        scanning <=> root.scanning;
-        result-count <=> root.result-count;
-        current-page <=> root.wifi-current-page;
-        total-pages <=> root.wifi-total-pages;
-        status-text <=> root.status-text;
-        scan-requested => { root.scan-requested(); }
-        swipe-up(dx, dy) => { root.wifi-scroll-up(); }
-        swipe-down(dx, dy) => { root.wifi-scroll-down(); }
-        swipe-right(dx, dy) => { root.current-app = -1; }
-        go-back => { root.current-app = -1; } go-home => { root.current-app = -1; }
-    }
     if current-app == 12: ImuPage {
         accel-x <=> root.accel-x;
         accel-y <=> root.accel-y;
@@ -368,18 +332,6 @@ export component MainWindow inherits Window {
             }
             root.current-app = -1;
         }
-    }
-    if current-app == 14: MetalsPage {
-        title: "HTTP GET";
-        accent: #5ca9ff;
-        time: root.metals-time;
-        xau: root.metals-xau;
-        xag: root.metals-xag;
-        net-status: root.metals-status;
-        refreshing <=> root.metals-refreshing;
-        refresh => { root.metals-refresh(); }
-        swipe-right(dx, dy) => { root.current-app = -1; }
-        go-back => { root.current-app = -1; } go-home => { root.current-app = -1; }
     }
     if current-app == 15: AudioPage {
         status-text <=> root.audio-status;

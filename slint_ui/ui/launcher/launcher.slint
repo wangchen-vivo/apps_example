@@ -23,10 +23,8 @@ export component Launcher inherits Rectangle {
     property <bool> icon1-pressed: false;
     property <bool> icon2-pressed: false;
     property <bool> icon3-pressed: false;
-    property <bool> icon4-pressed: false;
     property <bool> icon5-pressed: false;
     property <bool> icon6-pressed: false;
-    property <bool> icon7-pressed: false;
     property <bool> icon8-pressed: false;
     property <bool> icon9-pressed: false;
     property <bool> icon10-pressed: false;
@@ -130,47 +128,33 @@ export component Launcher inherits Rectangle {
                 }
             }
 
-            // Second page — 5 demos in a 3x2 grid.
+            // Second page — 4 demos in a 3x2 grid.
             Rectangle {
                 x: 480px; y: 0; width: 480px; height: parent.height;
 
-                icon4 := DemoIcon {
-                    x: 24px;  y: 30px;
-                    icon-text: Icons.wifi; label: "Wi-Fi 扫描";
-                    accent: #6fe0bd;
-                    pressed: root.icon4-pressed;
-                    clicked => { root.open-app(11); }
-                }
                 icon5 := DemoIcon {
-                    x: 168px; y: 30px;
+                    x: 24px; y: 30px;
                     icon-text: Icons.sensors; label: "IMU 传感器";
                     accent: #f08091;
                     pressed: root.icon5-pressed;
                     clicked => { root.open-app(12); }
                 }
                 icon6 := DemoIcon {
-                    x: 312px; y: 30px;
+                    x: 168px; y: 30px;
                     icon-text: Icons.sd-card; label: "SD 卡";
                     accent: #f0bd62;
                     pressed: root.icon6-pressed;
                     clicked => { root.open-app(13); }
                 }
-                icon7 := DemoIcon {
-                    x: 24px;  y: 220px;
-                    icon-text: Icons.download; label: "HTTP GET";
-                    accent: #5ca9ff;
-                    pressed: root.icon7-pressed;
-                    clicked => { root.open-app(14); }
-                }
                 icon8 := DemoIcon {
-                    x: 168px; y: 220px;
+                    x: 312px; y: 30px;
                     icon-text: Icons.music; label: "音频";
                     accent: #cf8ff2;
                     pressed: root.icon8-pressed;
                     clicked => { root.open-app(15); }
                 }
                 icon-power := DemoIcon {
-                    x: 312px; y: 220px;
+                    x: 24px; y: 220px;
                     icon-text: Icons.power; label: "电源";
                     accent: #f0bd62;
                     pressed: root.icon-power-pressed;
@@ -226,16 +210,14 @@ export component Launcher inherits Rectangle {
             // page 1: icons start at content-x 480
             // col 0 (x=24): range [480+24+inset, 480+144-inset] = [516, 612]
             if c >= 516.0 && c < 612.0 {
-                if my >= 30.0 && my < 200.0 { root.open-app(11); }
-                else if my >= 220.0 && my < 390.0 { root.open-app(14); }
+                if my >= 30.0 && my < 200.0 { root.open-app(12); }
+                else if my >= 220.0 && my < 390.0 { root.open-app(17); }
             // col 1 (x=168): range [480+168+inset, 480+288-inset] = [660, 756]
             } else if c >= 660.0 && c < 756.0 {
-                if my >= 30.0 && my < 200.0 { root.open-app(12); }
-                else if my >= 220.0 && my < 390.0 { root.open-app(15); }
+                if my >= 30.0 && my < 200.0 { root.open-app(13); }
             // col 2 (x=312): range [480+312+inset, 480+432-inset] = [804, 900]
             } else if c >= 804.0 && c < 900.0 {
-                if my >= 30.0 && my < 200.0 { root.open-app(13); }
-                else if my >= 220.0 && my < 390.0 { root.open-app(17); }
+                if my >= 30.0 && my < 200.0 { root.open-app(15); }
             }
         }
     }
@@ -258,14 +240,12 @@ export component Launcher inherits Rectangle {
             }
         } else {
             if c >= 516.0 && c < 612.0 {
-                if my >= 30.0 && my < 200.0 { root.icon4-pressed = true; }
-                else if my >= 220.0 && my < 390.0 { root.icon7-pressed = true; }
-            } else if c >= 660.0 && c < 756.0 {
                 if my >= 30.0 && my < 200.0 { root.icon5-pressed = true; }
-                else if my >= 220.0 && my < 390.0 { root.icon8-pressed = true; }
-            } else if c >= 804.0 && c < 900.0 {
-                if my >= 30.0 && my < 200.0 { root.icon6-pressed = true; }
                 else if my >= 220.0 && my < 390.0 { root.icon-power-pressed = true; }
+            } else if c >= 660.0 && c < 756.0 {
+                if my >= 30.0 && my < 200.0 { root.icon6-pressed = true; }
+            } else if c >= 804.0 && c < 900.0 {
+                if my >= 30.0 && my < 200.0 { root.icon8-pressed = true; }
             }
         }
     }
@@ -275,10 +255,8 @@ export component Launcher inherits Rectangle {
         root.icon1-pressed = false;
         root.icon2-pressed = false;
         root.icon3-pressed = false;
-        root.icon4-pressed = false;
         root.icon5-pressed = false;
         root.icon6-pressed = false;
-        root.icon7-pressed = false;
         root.icon8-pressed = false;
         root.icon9-pressed = false;
         root.icon10-pressed = false;
