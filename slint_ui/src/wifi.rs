@@ -27,6 +27,9 @@ const SCAN_POLL_INTERVAL_MS: u128 = 200;
 const INITIAL_SCAN_DELAY_MS: u128 = 400;
 const SCAN_BUFFER_SIZE: usize = 2048;
 const MAX_VISIBLE_NETWORKS: usize = 6;
+/// Keep at most the 8 strongest networks (decode_wifi_scan sorts by signal).
+/// Caps the per-scan row/SSID heap footprint on the small target heap.
+const MAX_KEPT_NETWORKS: usize = 8;
 
 #[derive(Debug)]
 struct WifiNetworkInfo {
@@ -210,7 +213,10 @@ fn decode_wifi_scan(buffer: &[u8]) -> IoResult<WifiScanResults> {
     let mut offset = 0;
     let count = take_bytes(buffer, &mut offset, 4)?;
     let count = u32::from_le_bytes(count.try_into().unwrap()) as usize;
-    let mut networks: Vec<WifiNetworkInfo> = Vec::with_capacity(count);
+    // Keep only the strongest MAX_KEPT_NETWORKS in a sorted window while
+    // decoding, so peak heap usage is bounded to the kept SSIDs rather than
+    // every network in the scan result.
+    let mut networks: Vec<WifiNetworkInfo> = Vec::with_capacity(MAX_KEPT_NETWORKS);
 
     for _ in 0..count {
         let ssid_len = take_bytes(buffer, &mut offset, 4)?;
@@ -238,10 +244,18 @@ fn decode_wifi_scan(buffer: &[u8]) -> IoResult<WifiScanResults> {
             channel,
             security,
         };
-        networks.push(network);
+        // Insert into the sorted top-K window: find the first entry weaker
+        // than the new network and shift the rest right, dropping the tail.
+        let insert_at = networks
+            .iter()
+            .position(|existing| network.signal_dbm > existing.signal_dbm)
+            .unwrap_or(MAX_KEPT_NETWORKS);
+        if insert_at < MAX_KEPT_NETWORKS {
+            networks.insert(insert_at, network);
+            networks.truncate(MAX_KEPT_NETWORKS);
+        }
     }
 
-    networks.sort_by(|left, right| right.signal_dbm.cmp(&left.signal_dbm));
     Ok(WifiScanResults {
         total_count: count,
         networks,
