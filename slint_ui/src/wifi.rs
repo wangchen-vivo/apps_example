@@ -246,18 +246,17 @@ fn decode_wifi_scan(buffer: &[u8]) -> IoResult<WifiScanResults> {
         };
         // Insert into the sorted top-K window: find the first entry weaker
         // than the new network and shift the rest right, dropping the tail.
+        // An empty (or all-stronger) list inserts at the end.
         let insert_at = networks
             .iter()
             .position(|existing| network.signal_dbm > existing.signal_dbm)
-            .unwrap_or(MAX_KEPT_NETWORKS);
-        if insert_at < MAX_KEPT_NETWORKS {
-            networks.insert(insert_at, network);
-            networks.truncate(MAX_KEPT_NETWORKS);
-        }
+            .unwrap_or(networks.len());
+        networks.insert(insert_at, network);
+        networks.truncate(MAX_KEPT_NETWORKS);
     }
 
     Ok(WifiScanResults {
-        total_count: count,
+        total_count: networks.len(),
         networks,
     })
 }
